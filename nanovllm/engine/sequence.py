@@ -64,10 +64,7 @@ class Sequence:
 
     def last_block(self, block_size=256):
         n = self.num_blocks
-        t = len(self) + block_size - self.num_blocks * block_size
-        x = self.token_ids[(n-1)*block_size:]
-        assert len(x) == t
-        return x
+        return self.token_ids[(n-1)*block_size:]
 
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)

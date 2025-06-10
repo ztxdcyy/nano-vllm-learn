@@ -4,7 +4,6 @@ import triton
 import triton.language as tl
 
 from vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-# from nanovllm.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
 
@@ -64,8 +63,8 @@ class Attention(nn.Module):
         context = get_context()
         k_cache = self.k_cache
         v_cache = self.v_cache
+        store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
             if context.block_tables is None:    # normal prefill
                 cu_seqlens_k = context.cu_seqlens_k
                 seqused_k = None
@@ -79,7 +78,7 @@ class Attention(nn.Module):
                                        seqused_k=seqused_k, softmax_scale=self.scale,
                                        causal=True, block_table=context.block_tables)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache, k.unsqueeze(1), v.unsqueeze(1),
+            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 
                                         softmax_scale=self.scale, causal=True)
         o = o.view(-1, self.num_heads * self.head_dim)

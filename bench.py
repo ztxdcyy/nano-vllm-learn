@@ -16,5 +16,5 @@ sampling_params = SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=ma
 
 t = time.time()
 completions = llm.generate(prompt_token_ids, sampling_params)
-troughput = batch_size * max_tokens / (time.time() - t)
-print(f"Throughput: {troughput: .2f}")
+throughput = batch_size * max_tokens / (time.time() - t)
+print(f"Throughput: {throughput: .2f}")

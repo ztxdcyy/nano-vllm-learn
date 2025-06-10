@@ -24,6 +24,6 @@ prompts = [
 completions = llm.generate(prompts, sampling_params)
 
 for p, c in zip(prompts, completions):
-    print("\n\n")
+    print("\n")
     print(f"Prompt: {p}")
     print(f"Completion: {c}")
