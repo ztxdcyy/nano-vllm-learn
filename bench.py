@@ -15,6 +15,6 @@ prompt_token_ids = torch.randint(0, 10240, (batch_size, seq_len)).tolist()
 sampling_params = SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=max_tokens)
 
 t = time.time()
-completions = llm.generate(prompt_token_ids, sampling_params)
+llm.generate(prompt_token_ids, sampling_params)
 throughput = batch_size * max_tokens / (time.time() - t)
 print(f"Throughput: {throughput: .2f}")

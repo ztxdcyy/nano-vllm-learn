@@ -52,7 +52,7 @@ class LLMEngine:
                 desc="Generating",
                 dynamic_ncols=True,
             )
-        if not isinstance(SamplingParams, list):
+        if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)

@@ -1,5 +1,4 @@
 torch
 triton
 transformers
-cmake
-ninja
+flash-attn
