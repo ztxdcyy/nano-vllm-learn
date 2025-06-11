@@ -3,7 +3,7 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
 
@@ -65,18 +65,12 @@ class Attention(nn.Module):
         v_cache = self.v_cache
         store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-            if context.block_tables is None:    # normal prefill
-                cu_seqlens_k = context.cu_seqlens_k
-                seqused_k = None
-            else:    # prefix cache
-                cu_seqlens_k = None
-                seqused_k = context.context_lens
+            if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=cu_seqlens_k,
-                                       seqused_k=seqused_k, softmax_scale=self.scale,
-                                       causal=True, block_table=context.block_tables)
+                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 

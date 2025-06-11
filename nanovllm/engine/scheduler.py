@@ -46,7 +46,7 @@ class Scheduler:
         # self.running = deque(sorted(self.running))
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append():
+            while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -66,7 +66,6 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
-        return True
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
         self.num_tokens += len(token_ids)

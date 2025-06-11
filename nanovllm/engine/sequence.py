@@ -12,6 +12,7 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
+    block_size = 256
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params: SamplingParams):
@@ -44,27 +45,27 @@ class Sequence:
 
     @num_cached_tokens.setter
     def num_cached_tokens(self, num_cached_tokens):
-        assert num_cached_tokens % 256 == 0
+        assert num_cached_tokens % self.block_size == 0
         self._num_cached_tokens = num_cached_tokens
 
     @property
     def num_cached_blocks(self):
-        return self.num_cached_tokens // 256
+        return self.num_cached_tokens // self.block_size
 
     @property
     def num_blocks(self):
-        return (len(self.token_ids) + 255) // 256
+        return (len(self.token_ids) + self.block_size - 1) // self.block_size
 
     @property
     def last_token(self):
         return self.token_ids[-1]
 
-    def block(self, i, block_size=256):
-        return self.token_ids[i*block_size: (i+1)*block_size]
+    def block(self, i):
+        return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
-    def last_block(self, block_size=256):
+    def last_block(self):
         n = self.num_blocks
-        return self.token_ids[(n-1)*block_size:]
+        return self.token_ids[(n-1)*self.block_size:]
 
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)

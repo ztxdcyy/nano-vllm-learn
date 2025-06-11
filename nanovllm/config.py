@@ -17,4 +17,4 @@ class Config:
 
     def __post_init__(self):
         assert self.model
-        assert self.kvcache_block_size == 256
+        assert self.kvcache_block_size % 256 == 0

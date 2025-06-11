@@ -21,9 +21,9 @@ prompts = [
     )
     for prompt in prompts
 ]
-completions = llm.generate(prompts, sampling_params)
+outputs = llm.generate(prompts, sampling_params)
 
-for p, c in zip(prompts, completions):
+for prompt, output in zip(prompts, outputs):
     print("\n")
-    print(f"Prompt: {p}")
-    print(f"Completion: {c}")
+    print(f"Prompt: {prompt}")
+    print(f"Completion: {output["text"]}")

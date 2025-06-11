@@ -17,6 +17,7 @@ class LLMEngine:
         for k, v in kwargs.items():
             if hasattr(config, k):
                 setattr(config, k, v)
+        Sequence.block_size = config.kvcache_block_size
         config.hf_config = AutoConfig.from_pretrained(config.model)
         config.max_model_len = min(config.max_model_len, config.hf_config.max_position_embeddings)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
@@ -74,7 +75,7 @@ class LLMEngine:
                 if finish and use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
-        outputs = [self.tokenizer.decode(token_ids) for token_ids in outputs]
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
             pbar.close()
         return outputs
