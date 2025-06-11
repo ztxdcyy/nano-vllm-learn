@@ -26,4 +26,4 @@ outputs = llm.generate(prompts, sampling_params)
 for prompt, output in zip(prompts, outputs):
     print("\n")
     print(f"Prompt: {prompt}")
-    print(f"Completion: {output["text"]}")
+    print(f"Completion: {output['text']}")

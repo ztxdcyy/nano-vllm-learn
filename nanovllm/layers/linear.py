@@ -105,7 +105,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
         super().__init__(input_size, sum(output_sizes), bias=bias)
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int | None = None):
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         param_data = param.data
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
@@ -145,7 +145,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         super().__init__(input_size, output_size, bias)
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None):
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
         assert loaded_shard_id in ["q", "k", "v"]
         if loaded_shard_id == "q":

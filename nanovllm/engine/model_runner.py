@@ -6,6 +6,7 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.memory import get_gpu_memory
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
@@ -20,7 +21,7 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
-        self.model.load_weights(config.model)
+        load_model(self.model, config.model)
         self.sampler = Sampler()
         self.allocate_kv_cache(config.gpu_memory_utilization)
         if not self.enforce_eager:
