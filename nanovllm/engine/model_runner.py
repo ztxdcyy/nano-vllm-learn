@@ -35,7 +35,7 @@ class ModelRunner:
         total, used, _ = get_gpu_memory()
         free = total * gpu_memory_utilization - used
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * hf_config.num_key_value_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(free * 1e6) // block_bytes
+        config.num_kvcache_blocks = int(free) // block_bytes
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, hf_config.num_key_value_heads, hf_config.head_dim)
         layer_id = 0
         for module in self.model.modules():

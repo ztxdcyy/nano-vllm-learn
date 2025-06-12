@@ -1,14 +1,18 @@
 import os
-import subprocess
 import torch
+from pynvml import *
 
 
-def get_gpu_memory(device_id: int = 0):
+def get_gpu_memory():
     torch.cuda.synchronize()
-    result = subprocess.check_output(
-        ['nvidia-smi', '-i', str(device_id), '--query-gpu=memory.total,memory.used,memory.free', '--format=csv,nounits,noheader'],
-        encoding='utf-8'
-    )
-    total_memory, used_memory, free_memory = [int(x) for x in result.strip().split(', ')]
+    nvmlInit()
+    visible_device = list(map(int, os.getenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(',')))
+    cuda_device_idx = torch.cuda.current_device()
+    cuda_device_idx = visible_device[cuda_device_idx]
+    handle = nvmlDeviceGetHandleByIndex(cuda_device_idx)
+    mem_info = nvmlDeviceGetMemoryInfo(handle)
+    total_memory = mem_info.total
+    used_memory = mem_info.used
+    free_memory = mem_info.free
+    nvmlShutdown()
     return total_memory, used_memory, free_memory
-    
