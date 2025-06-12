@@ -9,8 +9,8 @@ llm = LLM(path, enforce_eager=True)
 
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 prompts = [
-    "自我介绍一下吧！",
-    "列出100内所有素数",
+    "introduce yourself",
+    "list all prime numbers within 100",
 ]
 prompts = [
     tokenizer.apply_chat_template(
