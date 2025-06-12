@@ -1,20 +1,27 @@
 import os
 import time
-import torch
+from random import randint, seed
 from nanovllm import LLM, SamplingParams
+# from vllm import LLM, SamplingParams
 
 
-batch_size = 256
-seq_len = 1024
-max_tokens = 512
+seed(0)
+num_seqs = 256
+max_input_len = 1024
+max_ouput_len = 1024
 
 path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-llm = LLM(path, enforce_eager=False)
+llm = LLM(path, enforce_eager=False, max_model_len=4096)
 
-prompt_token_ids = torch.randint(0, 10240, (batch_size, seq_len)).tolist()
-sampling_params = SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=max_tokens)
+prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
+sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
+# uncomment the following line for vllm
+# prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
 
+llm.generate(["Benchmark: "], SamplingParams())
 t = time.time()
 llm.generate(prompt_token_ids, sampling_params)
-throughput = batch_size * max_tokens / (time.time() - t)
-print(f"Throughput: {throughput: .2f}")
+t = (time.time() - t)
+total_tokens = sum(sp.max_tokens for sp in sampling_params)
+throughput = total_tokens / t
+print(f"Total: {total_tokens}, Time: {t:.2f}s, Throughput: {throughput: .2f}")

@@ -8,7 +8,7 @@ from nanovllm.engine.sequence import Sequence
 def compute_hash(token_ids: list[int], prefix: int = -1):
     h = xxhash.xxh64()
     if prefix != -1:
-        h.update(prefix.to_bytes(8))
+        h.update(prefix.to_bytes(8, "little"))
     h.update(np.array(token_ids).tobytes())
     return h.intdigest()
 
