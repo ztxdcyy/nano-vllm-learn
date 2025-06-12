@@ -57,9 +57,6 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_prefill(self):
-        return len(self.free_block_ids) > 0.1 * len(self.blocks)
-
     def can_allocate(self, seq: Sequence):
         return len(self.free_block_ids) >= seq.num_blocks
 
