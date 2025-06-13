@@ -5,8 +5,8 @@ A lightweight vLLM implementation built from scratch.
 ## Key Features
 
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation under 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Torch compilation, CUDA graph, etc
+* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
+* ⚡ **Optimization Suite** - Prefix caching, Torch compilation, CUDA graph, etc.
 
 ## Installation
 

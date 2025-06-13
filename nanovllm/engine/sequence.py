@@ -36,8 +36,20 @@ class Sequence:
         return self.token_ids[key]
 
     @property
+    def is_finished(self):
+        return self.status == SequenceStatus.FINISHED
+
+    @property
     def num_completion_tokens(self):
         return len(self.token_ids) - self.num_prompt_tokens
+
+    @property
+    def prompt_token_ids(self):
+        return self.token_ids[:self.num_prompt_tokens]
+
+    @property
+    def completion_token_ids(self):
+        return self.token_ids[self.num_prompt_tokens:]
 
     @property
     def num_cached_tokens(self):
