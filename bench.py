@@ -24,4 +24,4 @@ llm.generate(prompt_token_ids, sampling_params)
 t = (time.time() - t)
 total_tokens = sum(sp.max_tokens for sp in sampling_params)
 throughput = total_tokens / t
-print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput: .2f}tok/s")
+print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
