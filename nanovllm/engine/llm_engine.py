@@ -1,4 +1,5 @@
 import atexit
+from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoTokenizer
@@ -14,13 +15,9 @@ from nanovllm.engine.model_runner import ModelRunner
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
-        config = Config(model)
-        for k, v in kwargs.items():
-            if hasattr(config, k):
-                setattr(config, k, v)
-        Sequence.block_size = config.kvcache_block_size
-        config.hf_config = AutoConfig.from_pretrained(config.model)
-        config.max_model_len = min(config.max_model_len, config.hf_config.max_position_embeddings)
+        config_fileds = {field.name for field in fields(Config)}
+        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fileds}
+        config = Config(model, **config_kwargs)
         self.ps = []
         self.events = []
         for i in range(1, config.tensor_parallel_size):

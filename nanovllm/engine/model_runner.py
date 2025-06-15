@@ -57,9 +57,7 @@ class ModelRunner:
     def loop(self):
         while True:
             method_name, args = self.read_shm()
-            method = getattr(self, method_name, None)
-            assert callable(method)
-            method(*args)
+            self.call(method_name, *args)
             if method_name == "exit":
                 break
 
@@ -82,8 +80,7 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
-        assert self.rank == 0
-        if self.world_size > 1:
+        if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         assert callable(method)
