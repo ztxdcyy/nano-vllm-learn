@@ -34,6 +34,7 @@ class LLMEngine:
 
     def exit(self):
         self.model_runner.call("exit")
+        del self.model_runner
         for p in self.ps:
             p.join()
 
