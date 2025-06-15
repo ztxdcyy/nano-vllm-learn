@@ -19,15 +19,17 @@ class Sequence:
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
+        self.last_token = token_ids[-1]
+        self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
-        self._num_cached_tokens = 0
+        self.num_cached_tokens = 0
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
     def __len__(self):
-        return len(self.token_ids)
+        return self.num_tokens
 
     def __lt__(self, other):
         return self.seq_id < other.seq_id
@@ -41,7 +43,7 @@ class Sequence:
 
     @property
     def num_completion_tokens(self):
-        return len(self.token_ids) - self.num_prompt_tokens
+        return self.num_tokens - self.num_prompt_tokens
 
     @property
     def prompt_token_ids(self):
@@ -52,32 +54,28 @@ class Sequence:
         return self.token_ids[self.num_prompt_tokens:]
 
     @property
-    def num_cached_tokens(self):
-        return self._num_cached_tokens
-
-    @num_cached_tokens.setter
-    def num_cached_tokens(self, num_cached_tokens):
-        assert num_cached_tokens % self.block_size == 0
-        self._num_cached_tokens = num_cached_tokens
-
-    @property
     def num_cached_blocks(self):
         return self.num_cached_tokens // self.block_size
 
     @property
     def num_blocks(self):
-        return (len(self.token_ids) + self.block_size - 1) // self.block_size
+        return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property
-    def last_token(self):
-        return self.token_ids[-1]
+    def last_block_num_tokens(self):
+        return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
     def block(self, i):
+        assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
-
-    def last_block(self):
-        n = self.num_blocks
-        return self.token_ids[(n-1)*self.block_size:]
 
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
+        self.last_token = token_id
+        self.num_tokens += 1
+
+    def __getstate__(self):
+        state = vars(self).copy()
+        if self.num_completion_tokens:
+            state.pop("token_ids")
+        return state
