@@ -2,7 +2,7 @@ import atexit
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -62,11 +62,7 @@ class LLMEngine:
         use_tqdm: bool = True,
     ) -> list[str]:
         if use_tqdm:
-            pbar = tqdm(
-                total=len(prompts),
-                desc="Generating",
-                dynamic_ncols=True,
-            )
+            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):

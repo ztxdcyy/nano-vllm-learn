@@ -31,9 +31,6 @@ class Sequence:
     def __len__(self):
         return self.num_tokens
 
-    def __lt__(self, other):
-        return self.seq_id < other.seq_id
-
     def __getitem__(self, key):
         return self.token_ids[key]
 
@@ -75,7 +72,14 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        state = vars(self).copy()
-        if self.num_completion_tokens:
-            state.pop("token_ids")
+        state = {
+            "num_tokens": self.num_tokens,
+            "num_prompt_tokens": self.num_prompt_tokens,
+            "num_cached_tokens": self.num_cached_tokens,
+            "block_table": self.block_table,
+        }
+        if self.num_completion_tokens == 0:
+            state["token_ids"] = self.token_ids
+        else:
+            state["last_token"] = self.last_token
         return state
