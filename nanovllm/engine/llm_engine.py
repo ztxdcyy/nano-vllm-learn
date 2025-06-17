@@ -20,9 +20,10 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.ps = []
         self.events = []
+        ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
-            event = mp.Event()
-            process = mp.Process(target=ModelRunner, args=(config, i, event))
+            event = ctx.Event()
+            process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
