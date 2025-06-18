@@ -53,6 +53,9 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
+        if not self.enforce_eager:
+            del self.graphs, self.graph_pool
+        torch.cuda.synchronize()
         dist.destroy_process_group()
 
     def loop(self):
