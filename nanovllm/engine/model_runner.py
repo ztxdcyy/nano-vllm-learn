@@ -6,10 +6,9 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.memory import get_gpu_memory
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
@@ -93,11 +92,11 @@ class ModelRunner:
     def allocate_kv_cache(self, gpu_memory_utilization):
         config = self.config
         hf_config = config.hf_config
-        total, used, _ = get_gpu_memory()
-        free = total * gpu_memory_utilization - used
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(free) // block_bytes
+        config.num_kvcache_blocks = int(total * gpu_memory_utilization - used) // block_bytes
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -142,7 +141,6 @@ class ModelRunner:
                     end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))
         assert len(input_ids) == len(slot_mapping)
-        assert len(input_ids) == cu_seqlens_q[-1]
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
