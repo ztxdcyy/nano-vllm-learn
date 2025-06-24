@@ -14,6 +14,15 @@ A lightweight vLLM implementation built from scratch.
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
 
+## Manual download
+
+If you’d rather fetch the model weights yourself, you can use:
+```bash
+huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
+  --local-dir ~/huggingface/Qwen3-0.6B/ \
+  --local-dir-use-symlinks False
+```
+
 ## Quick Start
 
 See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method.
