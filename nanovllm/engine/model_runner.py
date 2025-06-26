@@ -31,7 +31,8 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
-        self.allocate_kv_cache(config.gpu_memory_utilization)
+        peak = self.warmup_model()
+        self.allocate_kv_cache(config.gpu_memory_utilization, peak)
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -45,6 +46,18 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
+
+    def warmup_model(self):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_stats().get("allocated_bytes.all.peak", 0)
+        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        self.run(seqs, True)
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_stats().get("allocated_bytes.all.peak", 0)
+        return after - before
 
     def exit(self):
         if self.world_size > 1:
@@ -89,14 +102,15 @@ class ModelRunner:
         assert callable(method)
         return method(*args)
 
-    def allocate_kv_cache(self, gpu_memory_utilization):
+    def allocate_kv_cache(self, gpu_memory_utilization, peak):
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * gpu_memory_utilization - used) // block_bytes
+        config.num_kvcache_blocks = int(total * gpu_memory_utilization - used - peak) // block_bytes
+        print(f"{config.num_kvcache_blocks=}")
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -133,6 +147,8 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            if not seq.block_table:
+                continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
@@ -140,7 +156,6 @@ class ModelRunner:
                 else:
                     end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))
-        assert len(input_ids) == len(slot_mapping)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -177,7 +192,7 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
