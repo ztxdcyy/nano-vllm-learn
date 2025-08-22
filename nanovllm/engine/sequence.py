@@ -56,6 +56,7 @@ class Sequence:
 
     @property
     def num_blocks(self):
+        # 向上取整，seq-len=1000，block_size=256，num_blocks=4
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property

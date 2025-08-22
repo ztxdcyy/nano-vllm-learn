@@ -53,6 +53,8 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         # 初始化Seq，传入prompt和sampling_params
         # ？这里还是有点没搞清楚，为啥有时候会传id？token_ids
+        # 首先确定：add_request只有在generate里调用，我们就去找generate
+        # generate 查看引用：在example里面是传入prompt str，而bench的时候调用
         seq = Sequence(prompt, sampling_params)
         # 在scheduler的waiting队列加入当前seq
         self.scheduler.add(seq)
@@ -62,7 +64,7 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         # 2️⃣ 推理：把调度结果交给 model_runner 进行一次前向，返回新生成的 token_ids
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        # 3️⃣ 后处理：将新 token 写回序列、更新 KV 缓存、标记完成状态
+        # 3️⃣ 后处理：token_ids这里确保了只会吐出一个token。我们将新的token加到相应的seq里并且释放遇到EoS的seq
         self.scheduler.postprocess(seqs, token_ids)
         # 4️⃣ 收集已完成序列：只把is_finished的序列输出给上层
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]

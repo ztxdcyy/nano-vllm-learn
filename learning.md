@@ -90,6 +90,20 @@ sequence.append_token(京)  # 生成第二个token
 
 ## 分析
 
+* prefill 
+    * 取waiting[0]，若能调度，则popleft并加入running
+    * num_batched_tokens：当前batch中所有需要计算的token总数（seq0需要计算8k个，seq1需要计算9k个，此时seq1会被拒绝）
+    * self.block_manager.can_allocate(seq)返回false，此时也会拒绝调度
+
+* decode
+    * 取running[0]，准备为每个seq计算一个token
+    * can_append：`return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)`
+        * len(seq) = 255 此时对256（self.block_size）取余数，得到255，并不是1，判别式返回0。判断free_block_ids是否需要大于等于0，此时肯定是True的。
+        * len(seq) = 257 257%256=1 判别式返回True也就是1，判断free_block_ids是否需要大于等于1，也就意味着申请一个新的block。  
+
+
+preempt
+
 ## 代码拆解
 
 

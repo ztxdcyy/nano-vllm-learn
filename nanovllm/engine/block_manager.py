@@ -92,6 +92,11 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
+        # len(seq) = 255 256 257
+        # 255%256 = 255 !=1 free_block_ids>=0 return True
+        # 256%256=0!=1 free_block_ids>=0 return True
+        # 257%256=1 判断 free_block_ids 是否大于等于1，也就是是否有新的block供申请？
+        # 因为一个token只是占一个slot，而在block-kvcache中，只有block占满了，才会考虑申请新的block
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
