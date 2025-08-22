@@ -66,14 +66,19 @@ class Sequence:
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
+    # 在scheduler中有唯一调用
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+        if self.num_completion_tokens == 0:
+            token_data = self.token_ids
+        else:
+            token_data = self.last_token
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, 
+                self.block_table, token_data)
 
     def __setstate__(self, state):
         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
