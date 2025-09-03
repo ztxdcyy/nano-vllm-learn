@@ -9,33 +9,38 @@ from nanovllm.utils.context import get_context
 
 @triton.jit
 def store_kvcache_kernel(
-    key_ptr,
-    key_stride,
+    key_ptr,        # 传入kv tensor指针
+    key_stride,     # 告诉key value 如何跳行（dim）
     value_ptr,
     value_stride,
     k_cache_ptr,
     v_cache_ptr,
     slot_mapping_ptr,
-    D: tl.constexpr,
+    D: tl.constexpr,        # 常量参数，表示 head_dim × num_heads
 ):
-    idx = tl.program_id(0)
+    idx = tl.program_id(0)          # 获取当前 instance 的编号（类似 CUDA 里的 blockIdx.x）。这里每个 program 处理一个 key/value 对应的一行。
     key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
+    value_offsets = idx * value_stride + tl.arange(0, D)        # 获取偏移量，后续加载内存
+    key = tl.load(key_ptr + key_offsets)                        # 从新生成的key中读单独一个token的key
     value = tl.load(value_ptr + value_offsets)
-    slot = tl.load(slot_mapping_ptr + idx)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
+    slot = tl.load(slot_mapping_ptr + idx)                  # 计算存放的slot的值
+    cache_offsets = slot * D + tl.arange(0, D)              # 第slot行，从0到D-1
+    tl.store(k_cache_ptr + cache_offsets, key)              # 往计算好的slot位置写入新生成的kv
+    tl.store(v_cache_ptr + cache_offsets, value)            # 那我有个问题，对于prefill和decode阶段，计算的kvcache长度是不一样的呀？具体还得看flash_attn是怎么计算的，输入输出啥样的，如何处理pd阶段
 
 
-def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
+def store_kvcache(key: torch.Tensor, 
+                value: torch.Tensor, 
+                k_cache: torch.Tensor, 
+                v_cache: torch.Tensor, 
+                slot_mapping: torch.Tensor):
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
+    # 启动triton kernel：one dimension grid
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
@@ -51,7 +56,7 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.scale = scale
+        self.scale = scale          # softmax_scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
 

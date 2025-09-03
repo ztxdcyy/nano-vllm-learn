@@ -103,6 +103,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
+# （M，K）*（K，N）=（M，N）
+# (M, K)*(K, N/2)=(M, N/2)
+# need 
+# TP sharding
 class QKVParallelLinear(ColumnParallelLinear):
 
     def __init__(
@@ -128,17 +132,25 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert loaded_shard_id in ["q", "k", "v"]
         if loaded_shard_id == "q":
             shard_size = self.num_heads * self.head_size
-            shard_offset = 0
+            shard_offset = 0                # 先q
         elif loaded_shard_id == "k":
             shard_size = self.num_kv_heads * self.head_size
-            shard_offset = self.num_heads * self.head_size
+            shard_offset = self.num_heads * self.head_size          # 再k
         else:
             shard_size = self.num_kv_heads * self.head_size
-            shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
+            shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size     # 再v
+        
+        # param_data是大的QKV Embedding
+        # narrow方法返回的是指针而不是真的创建了内存
+        # 告诉当前TPrank，从哪里（offset）开始加载多大（shard_size）的一块连续内存
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
+        # loaded_weights沿着tp_dim维度切分tp_size个chunk，读取指定rank的chunk
+        # chunk 方法: 同样是 PyTorch 张量操作，它的作用是沿着指定维度 self.tp_dim 将张量切分成 self.tp_size 个等大小的块（或“块”的视图）。
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        # 将loaded_weight的指定chunk复制到param_data的指定位置（narrow）
+        # copy_ 原地操作（in-place）直接把loaded_weight的内存搬运到指定的narrow里，而不会新申请一块内存。合理
         param_data.copy_(loaded_weight)
-
+        
 
 class RowParallelLinear(LinearBase):
 

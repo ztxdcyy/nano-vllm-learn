@@ -86,7 +86,9 @@ sequence.append_token(京)  # 生成第二个token
 ```
 
 
-# [Scheduler](nanovllm/engine/scheduler.py)
+# Scheduler
+
+(nanovllm/engine/scheduler.py)
 
 ## 分析
 
@@ -108,3 +110,81 @@ preempt
 
 
 
+# Attention
+
+## Triton 入门概念
+
+程序并行模型
+Triton 类似 CUDA，会把 kernel 分成很多 program instances 执行，每个 instance 处理一部分数据。
+
+tl.program_id(0) 就是「当前 instance 的 id」，一般用来对应 batch 中的第几个样本。
+
+tl.arange(0, D) 生成一个 [0, 1, 2, ..., D-1] 的向量，常用于一次性加载/存储一段连续内存。
+
+内存操作
+
+tl.load(ptr + offsets)：从显存读取一段数据。offsets 通常是 vector，可以一次读多个。
+
+tl.store(ptr + offsets, data)：往显存写一段数据。
+
+Triton 默认会并行化这些向量操作，每个线程块内部能同时处理一批元素。
+
+kernel 调用方式
+
+store_kvcache_kernel[(N,)](...) → 这里 (N,) 表示 启动 N 个 program instance，每个 instance 负责处理一个样本的 key/value。
+
+相比 CUDA，Triton 把「block/grid/thread」抽象掉了，用更高层的「program」来表示。
+
+## 为什么选择triton做内存控制，而不是一股脑交给pytorch？
+
+逻辑是对的，但 PyTorch 内部会走一大堆流程：
+
+调用 dispatcher → 找到对应的 CUDA kernel → 启动 kernel → 把数据 copy。
+
+每一次写入都是一次「全局调度 + kernel 启动」。
+
+如果你的操作很细粒度（比如 KVCache 每个 step 只写很少的数据），这种额外开销非常明显。
+
+所以在大模型推理中（尤其是 prefill 之后的 decode 阶段），PyTorch 级别的 op 会成为 瓶颈。
+
+KVCache 的 写入量很小但很频繁（每生成一个 token，就要写一次）。
+
+小量频繁写，如果用 PyTorch，调度开销 > 真正计算/内存操作开销。
+
+Triton 可以把这些「小而多」的写合并成一个 kernel，高效搬运。
+
+## store_kvcache_kernel
+“读入当前 batch 的新 token 的 key/value 向量（从 key/value tensor），根据 slot_mapping 找到目标位置，把它们写进 KVCache。”
+
+
+
+
+# Linear
+
+## QKVParallelLinear（ColumnParallelLinear）
+
+根据类型计算 切分的偏移量 (shard_offset) 和 大小 (shard_size)：
+
+Q：偏移量为 0，因为它是第一个。
+
+K：偏移量在 Q 之后，即 self.num_heads * self.head_size。
+
+V：偏移量在 Q 和 K 之后，即 self.num_heads * self.head_size + self.num_kv_heads * self.head_size。
+
+```
+param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
+loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+param_data.copy_(loaded_weight)
+```
+
+定位目标（narrow）: “我的 GPU 上有一个很大的内存区域，我要在这块区域的特定位置，为我的 K 矩阵找到一个存储空间。”
+
+获取数据（chunk）: “磁盘上有一个完整的 K 矩阵文件，我要从中取出专门分配给我这台 GPU 的那一小部分数据。”
+
+写入数据（copy_）: “现在我有了我的存储空间，也有了我的数据，我把它俩精确地对接起来，把数据写入到对应的内存位置里去。”
+
+param_data.narrow(...)：这个操作用于在当前 GPU 的参数张量中，找到对应于当前 shard 的那一部分。
+
+loaded_weight.chunk(...)：将加载的权重 loaded_weight 沿着张量并行维度 (self.tp_dim) 切分，并只取当前 GPU 对应的部分 ([self.tp_rank])。
+
+param_data.copy_(loaded_weight)：最后，将切分后的权重 loaded_weight 复制到本地的参数张量中，完成了权重的加载。
