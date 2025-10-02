@@ -23,7 +23,7 @@ class LLMEngine:
         self.events = []       # 进程间同步事件列表 
         print(self.ps, self.events)
 
-        # spawn启动分布式TP，mp = torch.multiprocessing
+        # 通过torch.multiprocessing spawn形式，启动单机TP
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
@@ -52,9 +52,6 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         # 初始化Seq，传入prompt和sampling_params
-        # ？这里还是有点没搞清楚，为啥有时候会传id？token_ids
-        # 首先确定：add_request只有在generate里调用，我们就去找generate
-        # generate 查看引用：在example里面是传入prompt str，而bench的时候调用
         seq = Sequence(prompt, sampling_params)
         # 在scheduler的waiting队列加入当前seq
         self.scheduler.add(seq)
@@ -74,7 +71,7 @@ class LLMEngine:
             # prefill 阶段：返回所有序列 token 总数（正数）
             num_tokens = sum(len(seq) for seq in seqs)
         else:
-            # decode 阶段：返回序列条数的相反数（负数）
+            # decode 阶段：返回序列条数的相反数（负数），后面通过判断正负就可以知道是pd哪个阶段了，一种优化写法
             num_tokens = -len(seqs)
         # num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         # 返回：已完成序列列表 以及 本轮处理的 token 数（供外层进度条和吞吐计算使用）
@@ -103,9 +100,10 @@ class LLMEngine:
         # 核心循环，不断调用step，直到所有seq都完成
         while not self.is_finished():
             t = perf_counter()
-            # 执行step，返回output和num_tokens。
-            # output：(seq_id, 当前已生成的完整 token_ids)
+
+            # 执行step，返回output(seq_id, 当前已生成的完整 token_ids)和num_tokens
             output, num_tokens = self.step()
+
             # 可视化进度条，显示当前进度和当前的prefill和decode吞吐量。这里从代码推断的，没有实际跑，等我改掉attn！！！
             # 这里会根据num_tokens的正负号来区分是prefill还是decode阶段，从而计算吞吐量。减少了一个bool位的占用
             if use_tqdm:
@@ -117,12 +115,16 @@ class LLMEngine:
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
+
             for seq_id, token_ids in output:
-                # 这里用字典按 seq_id 做映射，避免重复并方便后续按原始顺序排序。
+                # 填写 output 键值对？
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)
+
+        # 根据 seq_id 汇总output，得到outputs
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
+        # 调用 transformers.tokenizer.decode 根据 token_ids 解码得到真正的 token 继续收集到 outputs 里面
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
             pbar.close()

@@ -8,7 +8,7 @@ from nanovllm.engine.block_manager import BlockManager
 class Scheduler:
 
     def __init__(self, config: Config):
-        self.max_num_seqs = config.max_num_seqs         # 默认512？并发能打这么大？一个小demo也这么能打？
+        self.max_num_seqs = config.max_num_seqs        
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -29,7 +29,7 @@ class Scheduler:
         scheduled_seqs = []         # step内成功调度的序列
         num_seqs = 0                # 已调度序列计数器
         num_batched_tokens = 0      # 当前batch中（所有running-seq）所有序列需要计算的token总数。“购物车的实时重量显示器”，告诉调度器"还能装多少"
-        # waiting队列不为空，且seq数量没有超限，就往running队列里塞seq，直到塞爆：max_num_tokens;max_num_seqs;max_model_len;
+        # waiting队列不为空，且seq数量没有超限，就往running队列里塞seq，直到塞爆：max_num_tokens&&max_num_seqs&&max_model_len;
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
             # 超出上限，跳出prefill循环

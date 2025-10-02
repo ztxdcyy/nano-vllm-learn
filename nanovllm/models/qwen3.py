@@ -183,6 +183,8 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
+    # HF 权重名字的重映射
+    # 把q、k、v 合并到一个大的qkv_proj里面，做一次大的gemm即可完成qkv embedding。减少权重IO和kernel launch
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),

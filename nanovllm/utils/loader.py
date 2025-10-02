@@ -10,7 +10,9 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 
 def load_model(model: nn.Module, path: str):
+    # hf weight 做重映射
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    # 从 hf safetensor 中加载权重（根据映射过后的名字）
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():

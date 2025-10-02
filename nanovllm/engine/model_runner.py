@@ -11,7 +11,9 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
-
+# 初始化流程中先通过 warmup_model 完成 “全局初始化”，
+# 再通过 capture_cudagraph 为不同 batch size 预存计算图，
+# 最终实现 “无论实际推理用什么 batch size，都能快速复用预存的图”。
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -23,6 +25,7 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # 使用 nccl 建立分布式通信 group
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
@@ -88,30 +91,51 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    # 常规 warmup，只要 init model runner，都要走一遍 warmup_model
     def warmup_model(self):
+        # 清空 GPU 上的 “未被使用的缓存内存碎片”
         torch.cuda.empty_cache()
+        # 重新统计下 GPU 最大可用峰值 mem
         torch.cuda.reset_peak_memory_stats()
+
+        # 确保生成的模拟序列既不超过总 token 限制，也不超过最大序列数限制。
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+
+        # 创建 dummySeqs，里面全是0
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        # 跑一下
         self.run(seqs, True)
+        # 清空
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
+
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        # 计算 kvcache 需要的字节数：2*num_layers*num_kv_heads*head_dim*block_size*torch.dtype
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
+        # 计算需要的 blocks数量，总共*利用率-所有mem中已用的-peak（allocator历史mem峰值）+ 当前allocator已分配的
+        # 主要防止 gpu allocator 可能还需要再用一些内存，所以为了保险，还把这部分也减去了
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
+        # kvcache 申请的时候是一个连续的多维的张量，现在需要绑定给指定 layer
         for module in self.model.modules():
+            # 假如 module 有 kvcache 属性，则是一个 attn module
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                # 我们将上面分配的连续的大缓存 self.kv_cache 的指定 layer 切片绑定成该 attn module 类的属性 ———— k_cache & v_cache 
+                # 这样 attn module 就可以直接用 kvcache 了，不用来大的再一个个找了。
+                # 具体看：nanovllm/layers/attention.py Attention.fwd 
+                # k_cache, v_cache = self.k_cache, self.v_cache
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
@@ -189,9 +213,11 @@ class ModelRunner:
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
+        # prefill 用不了 cudagraph
         else:
             bs = input_ids.size(0)
             context = get_context()
+            # 什么是 next？用于迭代器？
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             for k, v in graph_vars.items():
@@ -207,12 +233,13 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None        # prepare_sample：return temperatures
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
+    # 为一组 batch size（1,2,4,8,16…）预捕获计算图，并复用 graph memory pool
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
@@ -232,6 +259,7 @@ class ModelRunner:
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            # 真正的 warmup for cudagraph
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
