@@ -56,11 +56,12 @@ class Sequence:
 
     @property
     def num_blocks(self):
-        # 向上取整，seq-len=1000，block_size=256，num_blocks=4
+        # 向上取整：num_tokens=101 block_size=4 num_blocks=26
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property
     def last_block_num_tokens(self):
+        # num_tokens=101 num_blocks=26 block_size=4 last_block_num_tokens=1
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
     def block(self, i):
