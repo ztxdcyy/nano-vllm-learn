@@ -63,8 +63,10 @@ class ColumnParallelLinear(LinearBase):
         super().__init__(input_size, output_size, 0)
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
-
+        
+        # 先初始化一个大的全0矩阵
         self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, self.input_size))
+        # 初始化weight loader
         self.weight.weight_loader = self.weight_loader
         if bias:
             self.bias = nn.Parameter(torch.empty(self.output_size_per_partition))
@@ -72,9 +74,10 @@ class ColumnParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
+    # 使用weight loader加载shard对应位置权重
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
-        shard_size = param_data.size(self.tp_dim)
+        shard_size = param_data.size(self.tp_dim)       # 每块tp shard需要加载的dim数量（因为是ColumnLinear是切分成若干竖着长条的）
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
@@ -181,6 +184,7 @@ class RowParallelLinear(LinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        # 对于rowparallel需要做allreduce聚合结果
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y

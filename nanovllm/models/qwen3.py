@@ -38,6 +38,11 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
+        # 继承的ColumnParallel，沿着dim=0做切分
+        # Pytorch中，输入tensor x 按照行向量存储，一个样本是一行，这样符合c语言库存储习惯。
+        # 所以一般是y = x*W，行向量右乘权重矩阵，因此对W做列切分。
+        # 此时结果只需要allgather，若是x列切分，W行切分，RowParallel则需要allreduce聚合tp shard计算结果
+        # Output size: (total_num_heads + 2 * total_num_kv_heads) * head_size
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -45,6 +50,12 @@ class Qwen3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
+        # Each rank computes partial output and all_reduce to combine into the full hidden state.
+        # 输入形状：注意力计算后的输出
+        # o.shape = [batch_size * seq_len, total_num_heads * head_dim]
+        # total_num_heads * head_dim被分到各个TPrank上，每个TPrank独立做linear embedding，最后结果做allreduce
+        # 输出形状：投影回隐藏层维度
+        # output.shape = [batch_size * seq_len, hidden_size]
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -72,14 +83,17 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        # 这里的qkv shape = 
+        # 这里的qkv shape = [(total_num_heads + 2 * total_num_kv_heads) * head_size, num_heads*head_dim]
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
         q_by_head = q.view(-1, self.num_heads, self.head_dim)
         q_by_head = self.q_norm(q_by_head)
         q = q_by_head.view(q.shape)
+
         k_by_head = k.view(-1, self.num_kv_heads, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
+
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o)
