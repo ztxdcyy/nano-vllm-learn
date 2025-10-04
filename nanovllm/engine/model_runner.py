@@ -36,6 +36,7 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
+        # init modelrunner 的时候就会执行 capture_cudagraph，捕捉若干 bs 的计算图，加速推理
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -112,8 +113,9 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
 
+        # https://docs.pytorch.org/docs/stable/notes/cuda.html#memory-management
+        free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
@@ -124,8 +126,9 @@ class ModelRunner:
         # 计算需要的 blocks数量，总共*利用率-所有mem中已用的-peak（allocator历史mem峰值）+ 当前allocator已分配的
         # 主要防止 gpu allocator 可能还需要再用一些内存，所以为了保险，还把这部分也减去了
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-
         assert config.num_kvcache_blocks > 0
+
+        # 申请一块大 kvcache
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
         # kvcache 申请的时候是一个连续的多维的张量，现在需要绑定给指定 layer
@@ -165,8 +168,9 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
+
             if not seq.block_table:
-                continue
+                continue        # ？
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
@@ -176,8 +180,11 @@ class ModelRunner:
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        
+        # pin mem ？
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        # 累计前缀，获得一个超长，也就是做了flatten了？
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -215,60 +222,81 @@ class ModelRunner:
             return self.model.compute_logits(self.model(input_ids, positions))
         # prefill 用不了 cudagraph
         else:
+            # 获取正在跑的 seq batchsize
             bs = input_ids.size(0)
             context = get_context()
-            # 什么是 next？用于迭代器？
+            # 找到第一个 >= bs 的预捕获 batch size
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             for k, v in graph_vars.items():
                 if k != "outputs":
                     v.zero_()
+            # 只把前 bs 行写入真实数据
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            # run by replay
             graph.replay()
+            # 再把 前bs行的切片写回output
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # prepare for model_run
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None        # prepare_sample：return temperatures
+        # if decode, use cudagraph
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
-    # 为一组 batch size（1,2,4,8,16…）预捕获计算图，并复用 graph memory pool
+    # 为一组 bs 捕获计算图，并复用 graph 和 graph mem pool
+    # 
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
+        # config.max_num_seqs = 512
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+
+        # 根据最大 bs 创建一批持久化张量
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        # 假设 max_bs = 512, 则 graph_bs = [1,2,4,8,16,32,48, ..., 512]
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # 存放所有捕捉的计算图
         self.graphs = {}
         self.graph_pool = None
 
+        # 跑 bs = 8,4,2,1  为若干常用的 bs 各捕一张图；运行时按当前 bs 就近选择一张来重放。
+        # 先跑大的获取最大需要的graph pool，再捕较小的图时使用同一个内存池（with ... self.graph_pool），不再额外申请，从而减少向driver多次申请内存带来的时间开销。
+        # https://fireworks.ai/blog/speed-python-pick-two-how-cuda-graphs-enable-fast-python-code-for-deep-learning?utm_source=chatgpt.com#llm-inference--cuda-graphs
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
+            # nanovllm/utils/context.py 设置这些 global context 变量
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            # 真正的 warmup for cudagraph
+            # warmup for cudagraph
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            # 处理 for 循环第一个遍历的时候，还没创建graph pool，根据最大 bs 创建一个graph pool
+            # 之后 for 循环遍历的bs会复用该pool
+            # https://zhuanlan.zhihu.com/p/700224642
+            # https://docs.pytorch.org/docs/stable/generated/torch.cuda.CUDAGraph.html
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
             torch.cuda.synchronize()
             reset_context()
-
+        
+        # 创建一个字典，维护cudagraph需要用到的一系列变量
         self.graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
