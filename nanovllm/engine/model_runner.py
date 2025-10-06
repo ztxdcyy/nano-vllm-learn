@@ -209,11 +209,12 @@ class ModelRunner:
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 # 第 i 个 block 在 kvcache 中的起始位置
                 start = seq.block_table[i] * self.block_size
-                # 假如不是最后一个block，也就是完整，可以被 cached 的 block
+                # 假如不是最后一个block，也就是block一定是完整的。在 vLLM 中，只有完整的 block 才可以被 reuse
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size           
+                # 最后一个block很有可能是不完整的，我们通过last_block_num_tokens计算 end 位置
                 else:
-                    end = start + seq.last_block_num_tokens         # 在 nanovllm/engine/sequence.py 中定义了last_block_num_tokens属性
+                    end = start + seq.last_block_num_tokens         # 在 nanovllm/engine/sequence.py 中定义了last_block_num_tokens属性，最后一个 block 中的 token 个数
                 slot_mapping.extend(list(range(start, end)))        # slot_mapping 告诉attention kernel每个token应该存储在KV Cache的哪个位置，对应 prefill 是一连串 token 要写入，所以是 range
 
         # prefix cache

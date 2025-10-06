@@ -101,7 +101,7 @@ class Scheduler:
             # 上一步modelrunner确保了只吐出一个token（要是投机采样的话这里还得改）
             seq.append_token(token_id)
             # 检查该token_id，看看是不是结束了，需要释放资源
-            # case1:不忽略eos且tokenid是eos
+            # case1:不忽略 eos 且 tokenid 是 eos
             # case2:计算完的token数量达到最大token
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 # 更新状态：Finished；释放循环内seqs的内存，在running中移除该seq。
