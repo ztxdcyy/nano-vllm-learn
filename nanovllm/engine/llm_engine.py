@@ -70,7 +70,6 @@ class LLMEngine:
         if is_prefill:
             # prefill 阶段：返回所有序列 token 总数（正数）
             num_tokens = sum(len(seq) for seq in seqs)
-            print("num_tokens: ", num_tokens)
         else:
             # decode 阶段：返回序列条数的相反数（负数），后面通过判断正负就可以知道是pd哪个阶段了，一种优化写法
             num_tokens = -len(seqs)

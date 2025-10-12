@@ -252,7 +252,7 @@ class ModelRunner:
             start = seq.block_table[-1] * self.block_size
             offset = seq.last_block_num_tokens
             slot_loc = start + offset - 1
-            print("In Decode phrase, start and offset: ", start, offset)
+            # print("In Decode phrase, start and offset: ", start, offset)
             slot_mapping.append(slot_loc)
 
         # 创建 pin 传输
