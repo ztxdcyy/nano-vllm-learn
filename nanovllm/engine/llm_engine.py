@@ -21,7 +21,6 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.ps = []        # 存储TP子进程列表
         self.events = []       # 进程间同步事件列表 
-        print(self.ps, self.events)
 
         # 通过torch.multiprocessing spawn形式，启动单机TP
         ctx = mp.get_context("spawn")

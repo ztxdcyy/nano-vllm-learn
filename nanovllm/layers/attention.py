@@ -30,7 +30,7 @@ def store_kvcache_kernel(
     cache_offsets = slot * D + tl.arange(0, D)              # 第slot行，从0到D-1
     
     tl.store(k_cache_ptr + cache_offsets, key)              # 往计算好的slot位置写入新生成的kv
-    tl.store(v_cache_ptr + cache_offsets, value)            # 那我有个问题，对于prefill和decode阶段，计算的kvcache长度是不一样的呀？具体还得看flash_attn是怎么计算的，输入输出啥样的，如何处理pd阶段
+    tl.store(v_cache_ptr + cache_offsets, value)            # 对于 pd 阶段，kernel 只需要获取正确 slotmapping 即可正确写入 kvcache
 
 
 def store_kvcache(key: torch.Tensor, 
@@ -45,6 +45,11 @@ def store_kvcache(key: torch.Tensor,
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
     # 启动triton kernel：one dimension grid
+    flag = False
+    if not flag:
+        print("key stride: ", key.strdie(0))
+        print("slot_mapping:", slot_mapping)
+        flag = True
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 

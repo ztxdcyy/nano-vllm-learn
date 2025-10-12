@@ -101,9 +101,9 @@ class ModelRunner:
 
     # 常规 warmup，只要 init model runner，都要走一遍 warmup_model
     def warmup_model(self):
-        # 清空 GPU 上的 “未被使用的缓存内存碎片”
+        # 清空 pytorch allocator 占用但是未被使用的 GPU 内存碎片
         torch.cuda.empty_cache()
-        # 重新统计下 GPU 最大可用峰值 mem
+        # 重新统计下 GPU 最大使用峰值 mem
         torch.cuda.reset_peak_memory_stats()
 
         # 确保生成的模拟序列既不超过总 token 限制，也不超过最大序列数限制。
@@ -114,7 +114,6 @@ class ModelRunner:
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         # 跑一下
         self.run(seqs, True)
-        # 清空
         torch.cuda.empty_cache()
 
     # 申请一块连续的大 kvcache，然后根据 layerid 绑定到 对应layer的attention 模块的属性中
@@ -125,6 +124,7 @@ class ModelRunner:
         # https://docs.pytorch.org/docs/stable/notes/cuda.html#memory-management
         free, total = torch.cuda.mem_get_info()
         used = total - free
+        # 上一步更新过的
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
@@ -137,7 +137,8 @@ class ModelRunner:
         assert config.num_kvcache_blocks > 0
 
         # 向 GPU 申请一块大 kvcache
-        self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
+        self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks,
+                                     self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
         # kvcache 申请的时候是一个连续的多维的张量，现在需要绑定给指定 layer
         for module in self.model.modules():
@@ -357,10 +358,10 @@ class ModelRunner:
             outputs=outputs,
         )
 
-        # 简单打印graph_vars的键值对和检查是否全0
-        print("=== graph_vars字典内容 ===")
-        for key, value in self.graph_vars.items():
-            print(f"{key}: {value.shape} {value.dtype}")
-            print(f"是否全0: {torch.all(value == 0)}")
-            print("---")
-        print("=== 打印结束 ===")
+        # # 简单打印graph_vars的键值对和检查是否全0
+        # print("=== graph_vars字典内容 ===")
+        # for key, value in self.graph_vars.items():
+        #     print(f"{key}: {value.shape} {value.dtype}")
+        #     print(f"是否全0: {torch.all(value == 0)}")
+        #     print("---")
+        # print("=== 打印结束 ===")
