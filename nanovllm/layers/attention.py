@@ -27,7 +27,7 @@ def store_kvcache_kernel(
 
     # slot_mapping_ptr 是开始kvcache的物理地址，idx 是力工的编号，slot 是这一小队力工每个人对应一块砖头，总共对应一连串的砖头要搬运
     slot = tl.load(slot_mapping_ptr + idx)                  
-    cache_offsets = slot * D + tl.arange(0, D)              # 第slot行，从0到D-1
+    cache_offsets = slot * D + tl.arange(0, D)               
     
     tl.store(k_cache_ptr + cache_offsets, key)              # 往计算好的slot位置写入新生成的kv
     tl.store(v_cache_ptr + cache_offsets, value)            # 对于 pd 阶段，kernel 只需要获取正确 slotmapping 即可正确写入 kvcache
@@ -80,6 +80,7 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
+            # 计算完 kv 嵌入之后，调用 store_kvcache kernel 存进去当前token的kv
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         # 根据 PD 阶段，调用不同的 flash attention kernel

@@ -46,9 +46,9 @@ class ModelRunner:
             # rank0 负责创建 shm
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()      # 大哥到饭店，开好包间以后，等待其余进程
+                dist.barrier()      # 大哥：到饭店，开好包间以后，等待其余进程
             else:
-                dist.barrier()      # 小弟到饭店了，大哥开好包间了吗？
+                dist.barrier()      # 小弟：到饭店了，等大哥开包间吃饭
                 # 其余 rank 读取 shm，开始 loop 循环
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()     # 无限循环，等待 rank0 指令（从 shm 读指令和参数，直到 exit）
@@ -208,7 +208,7 @@ class ModelRunner:
                 continue        # 表示这条序列还没有被分配过 kv block，跳过后续的 slot_mapping 计算
             # 只处理新的token（没有被计算过 kvcache 的），计算 token 对应的物理地址 slot_mapping
             for i in range(seq.num_cached_blocks, seq.num_blocks):
-                # 第 i 个 block 在 kvcache 中的起始位置
+                # 第 i 个 block 在 全局 kvcache 中的起始位置
                 start = seq.block_table[i] * self.block_size
                 # 假如不是最后一个block，也就是block一定是完整的。在 vLLM 中，只有完整的 block 才可以被 reuse
                 if i != seq.num_blocks - 1:
@@ -219,8 +219,13 @@ class ModelRunner:
                 slot_mapping.extend(list(range(start, end)))        # slot_mapping 告诉attention kernel每个token应该存储在KV Cache的哪个位置，对应 prefill 是一连串 token 要写入，所以是 range
 
         # prefix cache
-        # k 的累计前缀和的最后一个元素大于q，也就意味着该 seq 存在已经计算过的 kvcache 的 token
+        # k 的累计前缀和的最后一个元素大于q，也就意味着该 seq 存在完整可复用 kvcache block
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    
+            # 检验：假如进入这个分支，assert error 并终止，可以看到在 example（较短 prompt，不存在 cached block） 中是不会进入这个分支的 
+            assert False, (
+                f"Unexpected state: cu_seqlens_k[-1] ({cu_seqlens_k[-1]}) > "
+                f"cu_seqlens_q[-1] ({cu_seqlens_q[-1]}). Check input sequences."
+            )
             # 创建 tensor， padding，并且传输到 gpu 上
             block_tables = self.prepare_block_tables(seqs)
         
@@ -243,17 +248,20 @@ class ModelRunner:
             input_ids.append(seq.last_token)            # 只取 last token
             positions.append(len(seq))
             context_lens.append(len(seq))
-            # slot_mapping 告诉attention kernel每个token应该存储在KV Cache的哪个位置
-            # 假如 BlockManager.allocate 给序列 seq 分配了两个 block，seq.block_table = [12, 5]，则 block_table[-1] = 5
-            # 第一块 256 个 token 已缓存完毕，第二块目前写入了 40 个 token
-            # 5*256+40-1=1319，这里每个 seq 只写入一个 token 的 在物理 kvcache 中 将要写入的位置
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+
+            start = seq.block_table[-1] * self.block_size
+            offset = seq.last_block_num_tokens
+            slot_loc = start + offset - 1
+            print("In Decode phrase, start and offset: ", start, offset)
+            slot_mapping.append(slot_loc)
+
         # 创建 pin 传输
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
+
         # attn kernel 通过 get context 得到上下文，decode 阶段主要是 kvcache 和 block table
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
@@ -358,10 +366,11 @@ class ModelRunner:
             outputs=outputs,
         )
 
-        # # 简单打印graph_vars的键值对和检查是否全0
-        # print("=== graph_vars字典内容 ===")
-        # for key, value in self.graph_vars.items():
-        #     print(f"{key}: {value.shape} {value.dtype}")
-        #     print(f"是否全0: {torch.all(value == 0)}")
-        #     print("---")
-        # print("=== 打印结束 ===")
+        # # # 简单打印graph_vars的键值对和检查是否全0
+        # # print("=== graph_vars字典内容 ===")
+        # # for key, value in self.graph_vars.items():
+        # #     print(f"{key}: {value.shape} {value.dtype}")
+        # #     print(f"是否全0: {torch.all(value == 0)}")
+        # #     print("---")
+        # # print("=== 打印结束 ===")
+        # 在初始化捕捉图的时候，只有 output 不是全 0

@@ -21,6 +21,7 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.ps = []        # 存储TP子进程列表
         self.events = []       # 进程间同步事件列表 
+        # print(self.ps, self.events)
 
         # 通过torch.multiprocessing spawn形式，启动单机TP
         ctx = mp.get_context("spawn")
@@ -31,7 +32,7 @@ class LLMEngine:
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        # 主进程运行ModelRunner实例
+        # 主进程实例化 ModelRunner
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         # 将tokenizer的eos_token_id同步到config.eos中
@@ -69,6 +70,7 @@ class LLMEngine:
         if is_prefill:
             # prefill 阶段：返回所有序列 token 总数（正数）
             num_tokens = sum(len(seq) for seq in seqs)
+            print("num_tokens: ", num_tokens)
         else:
             # decode 阶段：返回序列条数的相反数（负数），后面通过判断正负就可以知道是pd哪个阶段了，一种优化写法
             num_tokens = -len(seqs)
@@ -83,7 +85,7 @@ class LLMEngine:
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
-        use_tqdm: bool = True,
+        use_tqdm: bool = False,
     ) -> list[str]:
         # tqdm：python进度条库，用于显示进度条
         if use_tqdm:
@@ -91,16 +93,18 @@ class LLMEngine:
         # 创造和prompts等长的sampling_params列表，用于存储每个prompt的采样参数
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+
         # 将prompt和对应的sp打包成seq，添加到调度器中
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
+
         prefill_throughput = decode_throughput = 0.
         # 核心循环，不断调用step，直到所有seq都完成
         while not self.is_finished():
             t = perf_counter()
 
-            # 执行step，返回output(seq_id, 当前已生成的完整 token_ids)和num_tokens
+            # ❗❗❗ 执行step，返回output(seq_id, 当前已生成的完整 token_ids)和num_tokens
             output, num_tokens = self.step()
 
             # 可视化进度条，显示当前进度和当前的prefill和decode吞吐量。这里从代码推断的，没有实际跑，等我改掉attn！！！
@@ -116,7 +120,6 @@ class LLMEngine:
                 })
 
             for seq_id, token_ids in output:
-                # 填写 output 键值对？
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)

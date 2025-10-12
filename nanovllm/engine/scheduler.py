@@ -98,7 +98,8 @@ class Scheduler:
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
         for seq, token_id in zip(seqs, token_ids):
-            # 上一步modelrunner确保了只吐出一个token（要是投机采样的话这里还得改）
+            # 上一步modelrunner确保了只吐出一个token（要是投机采样的话这里还得改?）
+            print(" postprocess append_token")
             seq.append_token(token_id)
             # 检查该token_id，看看是不是结束了，需要释放资源
             # case1:不忽略 eos 且 tokenid 是 eos
