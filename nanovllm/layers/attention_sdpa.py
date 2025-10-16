@@ -37,7 +37,7 @@ def store_kvcache_kernel(
     slot = tl.load(slot_mapping_ptr + idx)                  # 计算存放的slot的值
     cache_offsets = slot * D + tl.arange(0, D)              # 第slot行，从0到D-1
     tl.store(k_cache_ptr + cache_offsets, key)              # 往计算好的slot位置写入新生成的kv
-    tl.store(v_cache_ptr + cache_offsets, value)            # 那我有个问题，对于prefill和decode阶段，计算的kvcache长度是不一样的呀？具体还得看flash_attn是怎么计算的，输入输出啥样的，如何处理pd阶段
+    tl.store(v_cache_ptr + cache_offsets, value)            
 
 
 def store_kvcache(key: torch.Tensor, 
@@ -51,7 +51,6 @@ def store_kvcache(key: torch.Tensor,
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
-    # 启动triton kernel：one dimension grid
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 # ==================== 构造兼容 flashattention 的 API ====================
@@ -68,28 +67,13 @@ def flash_attn_varlen_func(
     causal: bool = True,
     block_table: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """
-    兼容 flash_attn_varlen_func 的 SDPA 实现
-    输入形状: [total_tokens, num_heads, head_dim]
-    """
-    # 获取 batch size
     batch_size = cu_seqlens_q.shape[0] - 1
-    
-    # 输出张量
     outputs = []
 
-    # str = "="*30 + "QKV SHAPE" +"="*30 + '\n'
-    # _print_once(str, f"q.shape: {q.shape}, k.shape: {k.shape}, v.shape: {v.shape}")
-
-    # global _print_once_done
-    # _print_once_done = False
-
-    # str = "="*30 + "CU_SEQLENS" +"="*30 + '\n'
-    # _print_once(str, f"cu_seqlens_q: {cu_seqlens_q}, cu_seqlens_k: {cu_seqlens_k}")
-    
-    # 输入qkv是各个seq沿着len拼接在一起的，需要根据 cu_seqlens_q 分割成每个序列
+    # 输入qkv是各个seq沿着len拼接在一起的，需要根据 cu_seqlens_q 分割成单独序列
     for i in range(batch_size):
-        
+        _print_once(f"batchsize: {batch_size} \n")
+
         start_q = cu_seqlens_q[i]
         end_q = cu_seqlens_q[i + 1]
         start_k = cu_seqlens_k[i] 
