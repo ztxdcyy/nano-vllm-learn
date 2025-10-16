@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.backends.cuda import sdp_kernel
-from torch.nn.attention import SDPBackend
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from typing import Optional, Tuple, Any
 import triton
 import triton.language as tl
@@ -10,6 +9,15 @@ import triton.language as tl
 from ..utils.context import get_context
 from .linear import QKVParallelLinear
 
+_print_once_done = False
+
+def _print_once(*args):
+    global _print_once_done
+    if not _print_once_done:
+        print(*args)
+        _print_once_done = True
+
+# ==================== 保留原有的 store_kvcache kernel ====================
 @triton.jit
 def store_kvcache_kernel(
     key_ptr,        # 传入kv tensor指针
@@ -46,6 +54,130 @@ def store_kvcache(key: torch.Tensor,
     # 启动triton kernel：one dimension grid
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
+# ==================== 构造兼容 flashattention 的 API ====================
+
+def flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor, 
+    v: torch.Tensor,
+    max_seqlen_q: int,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_k: int,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    causal: bool = True,
+    block_table: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    兼容 flash_attn_varlen_func 的 SDPA 实现
+    输入形状: [total_tokens, num_heads, head_dim]
+    """
+    # 获取 batch size
+    batch_size = cu_seqlens_q.shape[0] - 1
+    
+    # 输出张量
+    outputs = []
+
+    # str = "="*30 + "QKV SHAPE" +"="*30 + '\n'
+    # _print_once(str, f"q.shape: {q.shape}, k.shape: {k.shape}, v.shape: {v.shape}")
+
+    # global _print_once_done
+    # _print_once_done = False
+
+    # str = "="*30 + "CU_SEQLENS" +"="*30 + '\n'
+    # _print_once(str, f"cu_seqlens_q: {cu_seqlens_q}, cu_seqlens_k: {cu_seqlens_k}")
+    
+    # 输入qkv是各个seq沿着len拼接在一起的，需要根据 cu_seqlens_q 分割成每个序列
+    for i in range(batch_size):
+        
+        start_q = cu_seqlens_q[i]
+        end_q = cu_seqlens_q[i + 1]
+        start_k = cu_seqlens_k[i] 
+        end_k = cu_seqlens_k[i + 1]
+        
+        # 获取当前序列的 Q, K, V
+        q_i = q[start_q:end_q]      # [seq_len_q, num_heads, head_dim]
+        k_i = k[start_k:end_k]      # [seq_len_k, num_kv_heads, head_dim] 
+        v_i = v[start_k:end_k]      # [seq_len_k, num_kv_heads, head_dim]
+        
+        # sdpa need batch dim。重塑为 SDPA 需要的形状: [seq_len, num_heads, head_dim] -> [1, seq_len, num_heads, head_dim]
+        seq_len_q = end_q - start_q
+        seq_len_k = end_k - start_k
+        
+        q_i = q_i.unsqueeze(0).transpose(1, 2)  # [1, num_heads, seq_len_q, head_dim]
+        k_i = k_i.unsqueeze(0).transpose(1, 2)  # [1, num_kv_heads, seq_len_k, head_dim]
+        v_i = v_i.unsqueeze(0).transpose(1, 2)  # [1, num_kv_heads, seq_len_k, head_dim]
+        
+        # GQA: 重复 K 和 V 以匹配 Q 的头数
+        num_queries_per_kv = q.shape[1] // k.shape[1]
+        if num_queries_per_kv > 1:
+            k_i = k_i.repeat_interleave(num_queries_per_kv, dim=1)  # [1, num_heads, seq_len_k, head_dim]
+            v_i = v_i.repeat_interleave(num_queries_per_kv, dim=1)  # [1, num_heads, seq_len_k, head_dim]
+        
+        # 使用 SDPA 计算注意力
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
+            output_i = F.scaled_dot_product_attention(
+                q_i, k_i, v_i,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=causal,
+                enable_gqa=True,
+                scale=softmax_scale
+            )
+        
+        # 重塑回原始形状: [1, num_heads, seq_len_q, head_dim] -> [seq_len_q, num_heads, head_dim]
+        output_i = output_i.transpose(1, 2).squeeze(0)  # [seq_len_q, num_heads, head_dim]
+        outputs.append(output_i)
+        # _print_once(output_i.shape)
+    
+    # 拼接所有序列的输出
+    return torch.cat(outputs, dim=0)
+
+
+def flash_attn_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    block_table: Optional[torch.Tensor] = None,
+    softmax_scale: float = 1.0,
+    causal: bool = True,
+) -> torch.Tensor:
+
+    batch_size = q.shape[0]
+    assert q.shape[1] == 1, "Decode stage should have seq_len=1"
+    
+    q_sdpa = q.transpose(1, 2)  # [batch_size, num_heads, 1, head_dim]
+    
+    # GQA: 重复 K 和 V 以匹配 Q 的头数
+    num_queries_per_kv = q.shape[2] // k_cache.shape[2]
+    if num_queries_per_kv > 1:
+        k_sdpa = k_cache.repeat_interleave(num_queries_per_kv, dim=2)  # [batch_size, cache_seq_len, num_heads, head_dim]
+        v_sdpa = v_cache.repeat_interleave(num_queries_per_kv, dim=2)  # [batch_size, cache_seq_len, num_heads, head_dim]
+    else:
+        k_sdpa = k_cache
+        v_sdpa = v_cache
+    
+    # 转置为 SDPA 格式
+    k_sdpa = k_sdpa.transpose(1, 2)  # [batch_size, num_heads, cache_seq_len, head_dim]
+    v_sdpa = v_sdpa.transpose(1, 2)  # [batch_size, num_heads, cache_seq_len, head_dim]
+
+    
+    # 使用 SDPA 计算注意力
+    with sdpa_kernel(backends=[SDPBackend.MATH]):
+        output = F.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=causal,
+            enable_gqa=True,
+            scale=softmax_scale
+        )
+    
+    output = output.transpose(1, 2)
+    return output
+
+# ==================== Attention 类实现 ====================
 
 class Attention(nn.Module):
     def __init__(
@@ -74,152 +206,60 @@ class Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        前向传播，兼容原有的 flashattention 调用方式
+        输入形状: [batch*seq_len, num_heads, head_dim]
+        """
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+
         context = get_context()
-        
-        # Input shapes from qwen3.py are already:
-        # Q: [batch*seq_len, num_heads, head_dim]
-        # K: [batch*seq_len, num_kv_heads, head_dim] 
-        # V: [batch*seq_len, num_kv_heads, head_dim]
-        
-        # For SDPA, we need to reshape to [batch, seq_len, num_heads, head_dim]
-        batch_size = q.shape[0] // (context.max_seqlen_q if context.is_prefill else 1)
-        seq_len = context.max_seqlen_q if context.is_prefill else 1
-        
-        # Reshape Q: [batch*seq_len, num_heads, head_dim] -> [batch, seq_len, num_heads, head_dim]
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        
-        # Reshape K, V: [batch*seq_len, num_kv_heads, head_dim] -> [batch, seq_len, num_kv_heads, head_dim]
-        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        
-        # Store KV cache if needed
-        if context.slot_mapping is not None and hasattr(self, 'k_cache') and hasattr(self, 'v_cache'):
-            store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping)
-        
-        # Handle different stages: Prefill vs Decode
+        k_cache, v_cache = self.k_cache, self.v_cache
+        if k_cache.numel() and v_cache.numel() and context.slot_mapping is not None:
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
         if context.is_prefill:
-            # Prefill stage: full sequence attention
-            output = self._prefill_attention(q, k, v, context)
-        else:
-            # Decode stage: incremental attention with KV cache
-            output = self._decode_attention(q, k, v, context)
-        
-        return output
-    
-    def _prefill_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        context: Any,
-    ) -> torch.Tensor:
-        """Prefill stage attention with full sequence."""
-        batch_size, seq_len, num_heads, head_dim = q.shape
-        
-        # Reshape for SDPA: [batch, seq_len, num_heads, head_dim] -> [batch, num_heads, seq_len, head_dim]
-        q = q.transpose(1, 2)  # [batch, num_heads, seq_len, head_dim]
-        
-        # For GQA, repeat K and V to match Q heads
-        # K, V shapes: [batch, seq_len, num_kv_heads, head_dim]
-        k = k.repeat_interleave(self.num_queries_per_kv, dim=2)  # [batch, seq_len, num_heads, head_dim]
-        v = v.repeat_interleave(self.num_queries_per_kv, dim=2)  # [batch, seq_len, num_heads, head_dim]
-        
-        # Reshape for SDPA: [batch, seq_len, num_heads, head_dim] -> [batch, num_heads, seq_len, head_dim]
-        k = k.transpose(1, 2)  # [batch, num_heads, seq_len, head_dim]
-        v = v.transpose(1, 2)  # [batch, num_heads, seq_len, head_dim]
-        
-        # Use SDPA with math backend - shapes match SDPA requirements:
-        # Q: [batch, num_heads, seq_len, head_dim] -> (N, Hq, L, E)
-        # K: [batch, num_heads, seq_len, head_dim] -> (N, H, S, E)  
-        # V: [batch, num_heads, seq_len, head_dim] -> (N, H, S, Ev)
-        with sdp_kernel(backends=[SDPBackend.MATH]):
-            output = F.scaled_dot_product_attention(
+            if context.block_tables is not None:  
+                k, v = k_cache, v_cache
+            
+            o = flash_attn_varlen_func(
                 q, k, v,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=True,
-                enable_gqa=True
+                max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                softmax_scale=self.scale,
+                causal=True,
+                block_table=context.block_tables
             )
-        
-        # Reshape back: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads, head_dim]
-        output = output.transpose(1, 2)  # [batch, seq_len, num_heads, head_dim]
-        
-        # Reshape to match qwen3.py expected output: [batch, seq_len, num_heads, head_dim] -> [batch*seq_len, num_heads * head_dim]
-        output = output.reshape(-1, self.num_heads * self.head_dim)
-        return output
-    
-    def _decode_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        context: Any,
-    ) -> torch.Tensor:
-        """Decode stage attention with KV cache."""
-        batch_size, seq_len, num_heads, head_dim = q.shape
-        
-        # For decode, we typically have seq_len=1
-        assert seq_len == 1
-        
-        # Reshape Q for SDPA: [batch, seq_len, num_heads, head_dim] -> [batch, num_heads, seq_len, head_dim]
-        q = q.transpose(1, 2)  # [batch, num_heads, 1, head_dim]
-        
-        # In decode stage, we need to use the full KV cache from previous tokens
-        # The current K, V are only for storage, not for attention computation
-        # For actual attention computation, we need to retrieve the cached K, V
-        # using context.block_tables and context.context_lens
-        
-        # For now, as a placeholder implementation, we'll use the cached K, V
-        # In a complete implementation, you would:
-        # 1. Retrieve cached K, V using block_tables and context_lens
-        # 2. Concatenate with current K, V if needed
-        # 3. Use the full sequence for attention
-        
-        # Use cached K, V for attention computation
-        if hasattr(self, 'k_cache') and hasattr(self, 'v_cache') and self.k_cache.numel() and self.v_cache.numel():
-            # For GQA, repeat cached K and V to match Q heads
-            k_attn = self.k_cache.repeat_interleave(self.num_queries_per_kv, dim=2)  # [batch, context_lens, num_heads, head_dim]
-            v_attn = self.v_cache.repeat_interleave(self.num_queries_per_kv, dim=2)  # [batch, context_lens, num_heads, head_dim]
-            
-            # Reshape for SDPA: [batch, context_lens, num_heads, head_dim] -> [batch, num_heads, context_lens, head_dim]
-            k_attn = k_attn.transpose(1, 2)  # [batch, num_heads, context_lens, head_dim]
-            v_attn = v_attn.transpose(1, 2)  # [batch, num_heads, context_lens, head_dim]
-            
-            # Use SDPA with math backend - shapes match SDPA requirements:
-            # Q: [batch, num_heads, 1, head_dim] -> (N, Hq, L, E)
-            # K: [batch, num_heads, context_lens, head_dim] -> (N, H, S, E)
-            # V: [batch, num_heads, context_lens, head_dim] -> (N, H, S, Ev)
-            with sdp_kernel(backends=[SDPBackend.MATH]):
-                output = F.scaled_dot_product_attention(
-                    q, k_attn, v_attn,
-                    attn_mask=None,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    enable_gqa=True
-                )
+            batch_size = context.cu_seqlens_q.shape[0] - 1
+            o = o.view(-1, self.num_heads * self.head_dim)
         else:
-            # Fallback to current K, V if cache is not available
-            # For GQA, repeat K and V to match Q heads
-            k_attn = k.repeat_interleave(self.num_queries_per_kv, dim=2)  # [batch, 1, num_heads, head_dim]
-            v_attn = v.repeat_interleave(self.num_queries_per_kv, dim=2)  # [batch, 1, num_heads, head_dim]
+            # Decode 阶段: 使用 flash_attn_with_kvcache 的兼容实现
+            # 重塑 q 为 [batch_size, 1, num_heads, head_dim]
+            batch_size = q.shape[0]
+            q_reshaped = q.view(batch_size, 1, self.num_heads, self.head_dim)
             
-            # Reshape for SDPA: [batch, seq_len, num_heads, head_dim] -> [batch, num_heads, seq_len, head_dim]
-            k_attn = k_attn.transpose(1, 2)  # [batch, num_heads, 1, head_dim]
-            v_attn = v_attn.transpose(1, 2)  # [batch, num_heads, 1, head_dim]
+            # 裁剪 KV 缓存以匹配当前 batch_size
+            if k_cache.numel() > 0 and v_cache.numel() > 0:
+                # 确保 KV 缓存的 batch_size 与当前输入一致
+                if k_cache.shape[0] > batch_size:
+                    k_cache = k_cache[:batch_size]
+                    v_cache = v_cache[:batch_size]
+                # 同时裁剪 context_lens 以匹配
+                if context.context_lens is not None and context.context_lens.shape[0] > batch_size:
+                    context_lens = context.context_lens[:batch_size]
+                else:
+                    context_lens = context.context_lens
             
-            # Use SDPA with math backend
-            with sdp_kernel(backends=[SDPBackend.MATH]):
-                output = F.scaled_dot_product_attention(
-                    q, k_attn, v_attn,
-                    attn_mask=None,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    enable_gqa=True
-                )
+            o = flash_attn_with_kvcache(
+                q.unsqueeze(1), k_cache, v_cache,
+                cache_seqlens=context.context_lens,
+                block_table=context.block_tables,
+                softmax_scale=self.scale,
+                causal=True
+            )
+            
+            # 重塑回原始形状
+            o = o.view(batch_size, self.num_heads * self.head_dim)
         
-        # Reshape back: [batch, num_heads, 1, head_dim] -> [batch, 1, num_heads, head_dim]
-        output = output.transpose(1, 2)  # [batch, 1, num_heads, head_dim]
-        
-        # Reshape to match qwen3.py expected output: [batch, 1, num_heads, head_dim] -> [batch, num_heads * head_dim]
-        output = output.reshape(-1, self.num_heads * self.head_dim)
-        return output
+        return o

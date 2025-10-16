@@ -221,11 +221,11 @@ class ModelRunner:
         # prefix cache
         # k 的累计前缀和的最后一个元素大于q，也就意味着该 seq 存在完整可复用 kvcache block
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    
-            # 检验：假如进入这个分支，assert error 并终止，可以看到在 example（较短 prompt，不存在 cached block） 中是不会进入这个分支的 
-            assert False, (
-                f"Unexpected state: cu_seqlens_k[-1] ({cu_seqlens_k[-1]}) > "
-                f"cu_seqlens_q[-1] ({cu_seqlens_q[-1]}). Check input sequences."
-            )
+            # # 检验：假如进入这个分支，assert error 并终止，可以看到在 example（较短 prompt，不存在 cached block） 中是不会进入这个分支的 
+            # assert False, (
+            #     f"Unexpected state: cu_seqlens_k[-1] ({cu_seqlens_k[-1]}) > "
+            #     f"cu_seqlens_q[-1] ({cu_seqlens_q[-1]}). Check input sequences."
+            # )
             # 创建 tensor， padding，并且传输到 gpu 上
             block_tables = self.prepare_block_tables(seqs)
         

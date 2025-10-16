@@ -53,8 +53,8 @@ def store_kvcache(key: torch.Tensor,
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
     # 启动triton kernel：one dimension grid
-    str = "="*30 + "slot mapping and stride" +"="*30 + '\n'
-    _print_once(str, "slot_mapping: ", slot_mapping, "\n key.shape:", key.shape, "\n k_cache.shape:", k_cache.shape,"\n D:", D)
+    # str = "="*30 + "slot mapping and stride" +"="*30 + '\n'
+    # _print_once(str, "slot_mapping: ", slot_mapping, "\n key.shape:", key.shape, "\n k_cache.shape:", k_cache.shape,"\n D:", D)
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
@@ -72,6 +72,7 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale          # softmax_scale
         self.num_kv_heads = num_kv_heads
+        # 初始化 kv cache 为空张量
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
@@ -92,11 +93,6 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
-            # 通过cu_seqlens_q和cu_seqlens_k来区分不同序列
-            # print('='*60)
-            # print("slot mapping: \n")
-            # print(context.slot_mapping)
-            # print('='*60)
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
