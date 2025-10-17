@@ -72,7 +72,7 @@ def flash_attn_varlen_func(
 
     # 输入qkv是各个seq沿着len拼接在一起的，需要根据 cu_seqlens_q 分割成单独序列
     for i in range(batch_size):
-        _print_once(f"batchsize: {batch_size} \n")
+        # _print_once(f"batchsize: {batch_size} \n")
 
         start_q = cu_seqlens_q[i]
         end_q = cu_seqlens_q[i + 1]
@@ -161,6 +161,28 @@ def flash_attn_with_kvcache(
     output = output.transpose(1, 2)
     return output
 
+
+def _gather_cache_tokens(
+    cache: torch.Tensor,
+    block_ids: torch.Tensor,
+    total_tokens: int,
+) -> torch.Tensor:
+    """按照 block_table 的顺序，把 cache 中对应的 token 拼接成连续序列。"""
+    block_size = cache.shape[1]
+    remaining = total_tokens
+    pieces = []
+    for block_id in block_ids.tolist():
+        if block_id < 0 or remaining <= 0:
+            break
+        take = min(block_size, remaining)
+        pieces.append(cache[block_id, :take])
+        remaining -= take
+    if remaining > 0:
+        raise RuntimeError(
+            f"无法从 KV cache 中凑齐 {total_tokens} 个 token，仍缺 {remaining} 个。"
+        )
+    return torch.cat(pieces, dim=0) if pieces else cache.new_zeros((0, cache.shape[2], cache.shape[3]))
+
 # ==================== Attention 类实现 ====================
 
 class Attention(nn.Module):
@@ -204,9 +226,26 @@ class Attention(nn.Module):
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         if context.is_prefill:
-            if context.block_tables is not None:  
-                k, v = k_cache, v_cache
-            
+            if (
+                context.block_tables is not None
+                and k_cache.numel()
+                and v_cache.numel()
+            ):
+                block_tables = context.block_tables
+                cu_seqlens_k = context.cu_seqlens_k
+                gathered_k = []
+                gathered_v = []
+                for idx in range(block_tables.size(0)):
+                    total_len = int(cu_seqlens_k[idx + 1].item() - cu_seqlens_k[idx].item())
+                    if total_len == 0:
+                        continue
+                    blocks = block_tables[idx].to(device="cpu")
+                    gathered_k.append(_gather_cache_tokens(k_cache, blocks, total_len))
+                    gathered_v.append(_gather_cache_tokens(v_cache, blocks, total_len))
+                if gathered_k:
+                    k = torch.cat(gathered_k, dim=0)
+                    v = torch.cat(gathered_v, dim=0)
+
             o = flash_attn_varlen_func(
                 q, k, v,
                 max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
