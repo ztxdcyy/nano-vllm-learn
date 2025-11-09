@@ -235,7 +235,12 @@ class Attention(nn.Module):
                 cu_seqlens_k = context.cu_seqlens_k
                 gathered_k = []
                 gathered_v = []
+                
+                # 这里的 block_tables size 是？batch？
+                _print_once(f"block_tables size: {block_tables.size()}")
+
                 for idx in range(block_tables.size(0)):
+                    # 这里总是涉及到  pytorch 张量到python 标量的转换，比较耗时，能不能干掉？
                     total_len = int(cu_seqlens_k[idx + 1].item() - cu_seqlens_k[idx].item())
                     if total_len == 0:
                         continue
