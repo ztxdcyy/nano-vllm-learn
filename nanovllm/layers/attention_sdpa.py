@@ -7,7 +7,6 @@ import triton
 import triton.language as tl
 
 from ..utils.context import get_context
-from .linear import QKVParallelLinear
 
 _print_once_done = False
 
@@ -63,16 +62,19 @@ def flash_attn_varlen_func(
     cu_seqlens_q: torch.Tensor,
     max_seqlen_k: int,
     cu_seqlens_k: torch.Tensor,
-    softmax_scale: float,
-    causal: bool = True,
-    block_table: Optional[torch.Tensor] = None,
+    causal,
+    block_table: Optional[torch.Tensor] = None,         # TODO 实现 prefix caching 的时候，prefill 也需要 kvcache
 ) -> torch.Tensor:
     batch_size = cu_seqlens_q.shape[0] - 1
     outputs = []
 
+    # 只在非warmup期间打印shape信息
+    context = get_context()
+    if not context.is_warmup:
+        print(f"[Note] batch_size is {batch_size}")
+
     # 输入qkv是各个seq沿着len拼接在一起的，需要根据 cu_seqlens_q 分割成单独序列
     for i in range(batch_size):
-        # _print_once(f"batchsize: {batch_size} \n")
 
         start_q = cu_seqlens_q[i]
         end_q = cu_seqlens_q[i + 1]
@@ -87,18 +89,11 @@ def flash_attn_varlen_func(
         # sdpa need batch dim。重塑为 SDPA 需要的形状: [seq_len, num_heads, head_dim] -> [1, seq_len, num_heads, head_dim]
         seq_len_q = end_q - start_q
         seq_len_k = end_k - start_k
+
+        # unsqueeze 出 bs 维度
+        q_i, k_i, v_i = [tensor.unsqueeze(0).transpose(1, 2) for tensor in [q_i, k_i, v_i]]
         
-        q_i = q_i.unsqueeze(0).transpose(1, 2)  # [1, num_heads, seq_len_q, head_dim]
-        k_i = k_i.unsqueeze(0).transpose(1, 2)  # [1, num_kv_heads, seq_len_k, head_dim]
-        v_i = v_i.unsqueeze(0).transpose(1, 2)  # [1, num_kv_heads, seq_len_k, head_dim]
-        
-        # GQA: 重复 K 和 V 以匹配 Q 的头数
-        num_queries_per_kv = q.shape[1] // k.shape[1]
-        if num_queries_per_kv > 1:
-            k_i = k_i.repeat_interleave(num_queries_per_kv, dim=1)  # [1, num_heads, seq_len_k, head_dim]
-            v_i = v_i.repeat_interleave(num_queries_per_kv, dim=1)  # [1, num_heads, seq_len_k, head_dim]
-        
-        # 使用 SDPA 计算注意力
+        # 注意不用自己重复 attn head，交给 SDPA 去处理 GQA
         with sdpa_kernel(backends=[SDPBackend.MATH]):
             output_i = F.scaled_dot_product_attention(
                 q_i, k_i, v_i,
@@ -106,13 +101,16 @@ def flash_attn_varlen_func(
                 dropout_p=0.0,
                 is_causal=causal,
                 enable_gqa=True,
-                scale=softmax_scale
+                scale=None
             )
         
         # 重塑回原始形状: [1, num_heads, seq_len_q, head_dim] -> [seq_len_q, num_heads, head_dim]
         output_i = output_i.transpose(1, 2).squeeze(0)  # [seq_len_q, num_heads, head_dim]
         outputs.append(output_i)
-        # _print_once(output_i.shape)
+        if not context.is_warmup:
+            print(f"[DEBUG] output_i shape:{output_i.shape}")
+        # else:
+        #     print(f"[DEBUG] IT IS WARMUP!!")
     
     # 拼接所有序列的输出
     return torch.cat(outputs, dim=0)
@@ -124,38 +122,72 @@ def flash_attn_with_kvcache(
     v_cache: torch.Tensor,
     cache_seqlens: torch.Tensor,
     block_table: Optional[torch.Tensor] = None,
-    softmax_scale: float = 1.0,
-    causal: bool = True,
+    causal: bool = False,
 ) -> torch.Tensor:
 
     batch_size = q.shape[0]
     assert q.shape[1] == 1, "Decode stage should have seq_len=1"
     
-    q_sdpa = q.transpose(1, 2)  # [batch_size, num_heads, 1, head_dim]
-    
-    # GQA: 重复 K 和 V 以匹配 Q 的头数
-    num_queries_per_kv = q.shape[2] // k_cache.shape[2]
-    if num_queries_per_kv > 1:
-        k_sdpa = k_cache.repeat_interleave(num_queries_per_kv, dim=2)  # [batch_size, cache_seq_len, num_heads, head_dim]
-        v_sdpa = v_cache.repeat_interleave(num_queries_per_kv, dim=2)  # [batch_size, cache_seq_len, num_heads, head_dim]
-    else:
-        k_sdpa = k_cache
-        v_sdpa = v_cache
-    
-    # 转置为 SDPA 格式
-    k_sdpa = k_sdpa.transpose(1, 2)  # [batch_size, num_heads, cache_seq_len, head_dim]
-    v_sdpa = v_sdpa.transpose(1, 2)  # [batch_size, num_heads, cache_seq_len, head_dim]
+    gathered_k = []
+    gathered_v = []
 
+    max_seq_len = int(cache_seqlens.max().item())           # For Padding
+    assert isinstance(max_seq_len, int) and max_seq_len > 0, "max_seq_len 必须是正整数"
     
-    # 使用 SDPA 计算注意力
+    # Gather Batched KV Cache
+    for i in range(batch_size):
+        seq_len = int(cache_seqlens[i].item())
+        assert seq_len != 0, "seqlen cannot be 0"
+
+        # if block_table is not None:
+        #     print(f"[DEBUG] block table is: {block_table}")
+        
+        blocks = block_table[i].to(device="cpu")        # 取出当前 seq 使用的 kvcache block id
+        
+        k_i, v_i = [_gather_cache_tokens(cache, blocks, seq_len) for cache in [k_cache, v_cache]]
+        # _print_once(f"[DEBUG] k_i shape is: {k_i.shape}")
+        # [DEBUG] k_i shape is: torch.Size([18, 8, 128]) [seq_len, num_kv_head, d_head]
+
+        # Concat for batch attn
+        k_i, v_i = [ tensor.unsqueeze(0) for tensor in [k_i, v_i]]
+
+        # In Decode Phrase, use Padding to solve the difference between seqs.
+        if seq_len < max_seq_len:
+            # create zeros seqs
+            k_pad = k_i.new_zeros((1, max_seq_len, k_i.size(2), k_i.size(3)))
+            v_pad = v_i.new_zeros((1, max_seq_len, v_i.size(2), v_i.size(3)))
+            # pad correct data into zero seqs
+            k_pad[:, :seq_len] = k_i
+            v_pad[:, :seq_len] = v_i
+            k_i, v_i = k_pad, v_pad
+
+        gathered_k.append(k_i)
+        gathered_v.append(v_i)
+    
+    # print(f"[DEBUG] gathered_k shape {gathered_k[0].shape}")
+    # [DEBUG] gathered_k shape torch.Size([1, 90, 8, 128])
+
+    batch_k, batch_v = [ torch.cat(tensor, dim=0) for tensor in [gathered_k, gathered_v]]       # 直接拼，拼不起来，需要 padding
+    # _print_once(f"[DEBUG] batch_k shape: {batch_k.shape}")
+
+    # create attn mask for sdpa kernel
+    arange_S = torch.arange(max_seq_len, device=cache_seqlens.device)
+    kv_valid = (arange_S.unsqueeze(0) < cache_seqlens.unsqueeze(1))   # [B, S_max] bool
+    attn_mask = kv_valid.unsqueeze(1).unsqueeze(1)                    # [B, 1, 1, S_max] bool
+
+    # 使用列表推导式，一行代码transpose三个变量 
+    # [bs, seq_len, num_head, d_head] -> [bs, num_head, seq_len, d_head]
+    q_sdpa, k_sdpa, v_sdpa = [tensor.transpose(1, 2) for tensor in [q, batch_k, batch_v]]
+
+    # Use SDPA for batched Attention
     with sdpa_kernel(backends=[SDPBackend.MATH]):
         output = F.scaled_dot_product_attention(
             q_sdpa, k_sdpa, v_sdpa,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=0.0,
-            is_causal=causal,
+            is_causal=causal,            # we don't need causal in decode phrase, because seq_len_q is 1.
             enable_gqa=True,
-            scale=softmax_scale
+            scale=None
         )
     
     output = output.transpose(1, 2)
@@ -163,14 +195,15 @@ def flash_attn_with_kvcache(
 
 
 def _gather_cache_tokens(
-    cache: torch.Tensor,
-    block_ids: torch.Tensor,
-    total_tokens: int,
+    cache: torch.Tensor,        # 从 cache 中取
+    block_ids: torch.Tensor,    # 根据 blockids 取
+    total_tokens: int,          # 总共要取多少个 tokens 的 kvcache
 ) -> torch.Tensor:
-    """按照 block_table 的顺序，把 cache 中对应的 token 拼接成连续序列。"""
+    
     block_size = cache.shape[1]
     remaining = total_tokens
     pieces = []
+
     for block_id in block_ids.tolist():
         if block_id < 0 or remaining <= 0:
             break
@@ -183,7 +216,6 @@ def _gather_cache_tokens(
         )
     return torch.cat(pieces, dim=0) if pieces else cache.new_zeros((0, cache.shape[2], cache.shape[3]))
 
-# ==================== Attention 类实现 ====================
 
 class Attention(nn.Module):
     def __init__(
@@ -199,10 +231,6 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         
-        # GQA support: num_heads must be divisible by num_kv_heads
-        assert num_heads % num_kv_heads == 0
-        self.num_queries_per_kv = num_heads // num_kv_heads
-        
         # Initialize KV cache
         self.k_cache = self.v_cache = torch.tensor([])
 
@@ -212,82 +240,37 @@ class Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        前向传播，兼容原有的 flashattention 调用方式
-        输入形状: [batch*seq_len, num_heads, head_dim]
-        """
+
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
 
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+
         if k_cache.numel() and v_cache.numel() and context.slot_mapping is not None:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         if context.is_prefill:
-            if (
-                context.block_tables is not None
-                and k_cache.numel()
-                and v_cache.numel()
-            ):
-                block_tables = context.block_tables
-                cu_seqlens_k = context.cu_seqlens_k
-                gathered_k = []
-                gathered_v = []
-                
-                # 这里的 block_tables size 是？batch？
-                _print_once(f"block_tables size: {block_tables.size()}")
-
-                for idx in range(block_tables.size(0)):
-                    # 这里总是涉及到  pytorch 张量到python 标量的转换，比较耗时，能不能干掉？
-                    total_len = int(cu_seqlens_k[idx + 1].item() - cu_seqlens_k[idx].item())
-                    if total_len == 0:
-                        continue
-                    blocks = block_tables[idx].to(device="cpu")
-                    gathered_k.append(_gather_cache_tokens(k_cache, blocks, total_len))
-                    gathered_v.append(_gather_cache_tokens(v_cache, blocks, total_len))
-                if gathered_k:
-                    k = torch.cat(gathered_k, dim=0)
-                    v = torch.cat(gathered_v, dim=0)
+            if context.block_tables is not None:    # Prefill may also need kvcache for prefix caching
+                k, v = k_cache, v_cache
 
             o = flash_attn_varlen_func(
                 q, k, v,
                 max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                 max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                softmax_scale=self.scale,
                 causal=True,
                 block_table=context.block_tables
-            )
-            batch_size = context.cu_seqlens_q.shape[0] - 1
-            o = o.view(-1, self.num_heads * self.head_dim)
-        else:
-            # Decode 阶段: 使用 flash_attn_with_kvcache 的兼容实现
-            # 重塑 q 为 [batch_size, 1, num_heads, head_dim]
-            batch_size = q.shape[0]
-            q_reshaped = q.view(batch_size, 1, self.num_heads, self.head_dim)
-            
-            # 裁剪 KV 缓存以匹配当前 batch_size
-            if k_cache.numel() > 0 and v_cache.numel() > 0:
-                # 确保 KV 缓存的 batch_size 与当前输入一致
-                if k_cache.shape[0] > batch_size:
-                    k_cache = k_cache[:batch_size]
-                    v_cache = v_cache[:batch_size]
-                # 同时裁剪 context_lens 以匹配
-                if context.context_lens is not None and context.context_lens.shape[0] > batch_size:
-                    context_lens = context.context_lens[:batch_size]
-                else:
-                    context_lens = context.context_lens
-            
+            ) 
+
+        else:   
+                # print(f"[DEBUG] context len is: {context.context_lens}")
+                # [DEBUG] context len is: tensor([18, 16], device='cuda:0', dtype=torch.int32)
             o = flash_attn_with_kvcache(
                 q.unsqueeze(1), k_cache, v_cache,
                 cache_seqlens=context.context_lens,
                 block_table=context.block_tables,
-                softmax_scale=self.scale,
-                causal=True
+                causal=False,
             )
-            
-            # 重塑回原始形状
-            o = o.view(batch_size, self.num_heads * self.head_dim)
         
-        return o
+        return o.view(-1, self.num_heads * self.head_dim)

@@ -37,7 +37,7 @@ class ModelRunner:
         self.allocate_kv_cache()
         # init modelrunner 的时候就会执行 capture_cudagraph，捕捉若干 bs 的计算图，加速推理
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            self.capture_cudagraph()            # capture cudagraph in init phrase, warmup!
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -113,7 +113,7 @@ class ModelRunner:
         # 创建 dummySeqs，里面全是0
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         # 跑一下
-        self.run(seqs, True)
+        self.run(seqs, True, is_warmup=True)
         torch.cuda.empty_cache()
 
     # 申请一块连续的大 kvcache，然后根据 layerid 绑定到 对应layer的attention 模块的属性中
@@ -236,7 +236,8 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         # attn kernel 通过 get context 得到上下文，prefill 阶段主要是  flashattention kernel 要用到的一些参数
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, is_warmup=True)
+        # print(f"[DEBUG PREFILL] BLOCK TABLE: {block_tables} \n[DEBUG PREFILL] SLOT MAPPING: {slot_mapping}")
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -263,7 +264,8 @@ class ModelRunner:
         block_tables = self.prepare_block_tables(seqs)
 
         # attn kernel 通过 get context 得到上下文，decode 阶段主要是 kvcache 和 block table
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, is_warmup=True)
+        # print(f"[DEBUG DECODE] BLOCK TABLE: {block_tables} \n[DEBUG DEOCDE] SLOT MAPPING: {slot_mapping}")
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -299,7 +301,7 @@ class ModelRunner:
             # 取字典 key="outputs" 对应的值，取前 bs 切片，返回
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool, is_warmup:bool=False) -> list[int]:
         # prepare for model_run：prefill or decode
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None        # prepare_sample：return temperatures
@@ -339,7 +341,7 @@ class ModelRunner:
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             # nanovllm/utils/context.py 设置这些 global context 变量
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], is_warmup=True)
             # warmup for cudagraph capture
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
             # capture cudagraph，捕捉但不执行。

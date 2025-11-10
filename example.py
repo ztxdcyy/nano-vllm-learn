@@ -4,8 +4,8 @@ from transformers import AutoTokenizer
 
 
 def main():
-    # path = os.path.expanduser("/root/workspace/nano-vllm-learn/huggingface/Qwen3-0.6B/")
-    path = os.path.expanduser("/gemini/pretrain/Qwen3-0.6B")
+    path = os.path.expanduser("/root/workspace/nano-vllm-learn/huggingface/Qwen3-0.6B/")
+    # path = os.path.expanduser("/gemini/pretrain/Qwen3-0.6B")
     
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
