@@ -127,71 +127,52 @@ def flash_attn_with_kvcache(
 
     batch_size = q.shape[0]
     assert q.shape[1] == 1, "Decode stage should have seq_len=1"
-    
-    gathered_k = []
-    gathered_v = []
+    # CUDAGraph 复用时需要避免 Python 侧取 .item()/.tolist()，所以用纯张量算子收集 KV。
+    # block_table 是 [B, num_blocks] 的页表，每个 token 的物理块 = block_table[token // block_size]。
+    if block_table is None:
+        max_seq_len = int(cache_seqlens.max().item()) if cache_seqlens.numel() else 0
+        if max_seq_len <= 0:
+            return q.new_zeros(q.shape)
+        batch_k = k_cache
+        batch_v = v_cache
+        if k_cache.size(1) < max_seq_len:
+            pad_len = max_seq_len - k_cache.size(1)
+            pad_shape = (batch_size, pad_len, k_cache.size(2), k_cache.size(3))
+            batch_k = torch.cat([k_cache, k_cache.new_zeros(pad_shape)], dim=1)
+            batch_v = torch.cat([v_cache, v_cache.new_zeros(pad_shape)], dim=1)
+        kv_valid = torch.arange(max_seq_len, device=cache_seqlens.device).unsqueeze(0) < cache_seqlens.unsqueeze(1)
+    else:
+        block_size = k_cache.size(1)
+        block_table = block_table.to(dtype=torch.long)
+        max_blocks = block_table.size(1)
+        max_seq_len = max_blocks * block_size
+        positions = torch.arange(max_seq_len, device=cache_seqlens.device, dtype=torch.long)
+        block_idx = positions // block_size
+        offset = positions % block_size
+        block_ids = block_table[:, block_idx].clamp(min=0)   # [B, S]
+        flat_idx = block_ids * block_size + offset       # [B, S]
+        cache_flat_k = k_cache.view(-1, k_cache.size(2), k_cache.size(3))
+        cache_flat_v = v_cache.view(-1, v_cache.size(2), v_cache.size(3))
+        batch_k = cache_flat_k[flat_idx]                 # [B, S, num_kv_heads, head_dim]
+        batch_v = cache_flat_v[flat_idx]
+        kv_valid = positions.unsqueeze(0) < cache_seqlens.unsqueeze(1)   # [B, S] bool
+        batch_k = batch_k * kv_valid.unsqueeze(-1).unsqueeze(-1)
+        batch_v = batch_v * kv_valid.unsqueeze(-1).unsqueeze(-1)
+    attn_mask = kv_valid.unsqueeze(1).unsqueeze(1)                    # [B, 1, 1, S]
 
-    max_seq_len = int(cache_seqlens.max().item())           # For Padding
-    assert isinstance(max_seq_len, int) and max_seq_len > 0, "max_seq_len 必须是正整数"
-    
-    # Gather Batched KV Cache
-    for i in range(batch_size):
-        seq_len = int(cache_seqlens[i].item())
-        assert seq_len != 0, "seqlen cannot be 0"
-
-        # if block_table is not None:
-        #     print(f"[DEBUG] block table is: {block_table}")
-        
-        blocks = block_table[i].to(device="cpu")        # 取出当前 seq 使用的 kvcache block id
-        
-        k_i, v_i = [_gather_cache_tokens(cache, blocks, seq_len) for cache in [k_cache, v_cache]]
-        # _print_once(f"[DEBUG] k_i shape is: {k_i.shape}")
-        # [DEBUG] k_i shape is: torch.Size([18, 8, 128]) [seq_len, num_kv_head, d_head]
-
-        # Concat for batch attn
-        k_i, v_i = [ tensor.unsqueeze(0) for tensor in [k_i, v_i]]
-
-        # In Decode Phrase, use Padding to solve the difference between seqs.
-        if seq_len < max_seq_len:
-            # create zeros seqs
-            k_pad = k_i.new_zeros((1, max_seq_len, k_i.size(2), k_i.size(3)))
-            v_pad = v_i.new_zeros((1, max_seq_len, v_i.size(2), v_i.size(3)))
-            # pad correct data into zero seqs
-            k_pad[:, :seq_len] = k_i
-            v_pad[:, :seq_len] = v_i
-            k_i, v_i = k_pad, v_pad
-
-        gathered_k.append(k_i)
-        gathered_v.append(v_i)
-    
-    # print(f"[DEBUG] gathered_k shape {gathered_k[0].shape}")
-    # [DEBUG] gathered_k shape torch.Size([1, 90, 8, 128])
-
-    batch_k, batch_v = [ torch.cat(tensor, dim=0) for tensor in [gathered_k, gathered_v]]       # 直接拼，拼不起来，需要 padding
-    # _print_once(f"[DEBUG] batch_k shape: {batch_k.shape}")
-
-    # create attn mask for sdpa kernel
-    arange_S = torch.arange(max_seq_len, device=cache_seqlens.device)
-    kv_valid = (arange_S.unsqueeze(0) < cache_seqlens.unsqueeze(1))   # [B, S_max] bool
-    attn_mask = kv_valid.unsqueeze(1).unsqueeze(1)                    # [B, 1, 1, S_max] bool
-
-    # 使用列表推导式，一行代码transpose三个变量 
-    # [bs, seq_len, num_head, d_head] -> [bs, num_head, seq_len, d_head]
     q_sdpa, k_sdpa, v_sdpa = [tensor.transpose(1, 2) for tensor in [q, batch_k, batch_v]]
 
-    # Use SDPA for batched Attention
     with sdpa_kernel(backends=[SDPBackend.MATH]):
         output = F.scaled_dot_product_attention(
             q_sdpa, k_sdpa, v_sdpa,
             attn_mask=attn_mask,
             dropout_p=0.0,
-            is_causal=causal,            # we don't need causal in decode phrase, because seq_len_q is 1.
+            is_causal=causal,
             enable_gqa=True,
             scale=None
         )
     
-    output = output.transpose(1, 2)
-    return output
+    return output.transpose(1, 2)
 
 
 def _gather_cache_tokens(

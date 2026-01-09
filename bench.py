@@ -7,13 +7,14 @@ from nanovllm import LLM, SamplingParams
 
 def main():
     seed(0)
-    num_seqs = 256
-    max_input_len = 1024
-    max_ouput_len = 1024
+    # Keep the workload small to avoid OOM during local benchmarking.
+    num_seqs = 64
+    max_input_len = 256
+    max_ouput_len = 256
 
     # path = os.path.expanduser("/root/workspace/nano-vllm-learn/huggingface/Qwen3-0.6B")
     path = os.path.expanduser("/gemini/pretrain/Qwen3-0.6B")
-    llm = LLM(path, enforce_eager=False, max_model_len=4096)
+    llm = LLM(path, enforce_eager=False, max_model_len=2048)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
