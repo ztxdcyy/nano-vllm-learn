@@ -7,11 +7,34 @@
 # 采用SDPA代替flash-attn：
 * 主要工作量是如何从block-tables里取到对应的kvcache。
 * 主要踩坑的地方是和cudagraph的兼容问题：可以看这个[commit](https://github.com/ztxdcyy/nano-vllm-learn/commit/2f1a0ae2df9f7729494c5c70caf010dd786d2b5e)
-1. 在捕捉cudagraph的时候禁止python侧的操作，所以原来的tolist、item这些都不能用
+1. 在捕捉cudagraph的时候禁止 host 侧的操作，具体可以看kaichao这篇文章，所以原来的tolist、item这些都不能用
 2. 还是捕捉cudagraph的时候（ModelRunner.capture_cudagraph），dummyinput在构造的时候，context_lens=torch.zeros(...)。和我原来的一个assert冲突了`assert isinstance(max_seq_len, int) and max_seq_len > 0, "max_seq_len 必须是正整数"`，添加了更鲁棒的判断来兼容capture cudagraph跑dummyinput的场景。
+* 踩坑的地方+1：传递backend的时候一直没传hf_config，导致一直跑的都是flash_attn也就是attn_sdpa.py完全没被用上！所以基本上测出来吞吐没变！！！（🥲尴尬……）
+
+在这套代码里，模型构造用的是读的是 Qwen3Config 实例（dataclass：config.hf_config），Qwen3DecoderLayer/Qwen3Attention 只看它：attn_backend=getattr(config, "attn_backend", "flash")。LLMEngine.Config 是运行时包装，模型只会拿到hf_config（Qwen3Config）不会把 大的运行时Config 传进去。所以不把 attn_backend 写回 hf_config，模型侧永远拿不到你传的后端，默认为 flash。传递过去只是为了让 HF config 携带这个自定义字段，使模型能读到。
 
 
 # bench
+
+```
+(nano_venv) root@autodl-container-b95c4d8452-4b3d06c8:~/workspace/nano-vllm-learn# python bench_my.py --attn-backend flash sdpa
+`torch_dtype` is deprecated! Use `dtype` instead!
+^[[A^[[B
+================================================================================
+CROSSOVER ANALYSIS
+================================================================================
+ Input Len |  Flash (ms) |    Flash tp |  SDPA (ms) |    SDPA tp |   Winner |  Speedup
+------------------------------------------------------------------------------------------------
+       512 |    3075.008 |        5328 |  42203.928 |        388 |    Flash |   13.72x
+      1024 |    4267.898 |        3839 |  64877.147 |        253 |    Flash |   15.20x
+      1536 |    5468.262 |        2996 |  88115.733 |        186 |    Flash |   16.11x
+      2048 |    6651.592 |        2463 | 111999.628 |        146 |    Flash |   16.84x
+      2560 |    7869.468 |        2082 | 136555.871 |        120 |    Flash |   17.35x
+      3072 |    9091.268 |        1802 | 161280.169 |        102 |    Flash |   17.74x
+      3584 |   10328.921 |        1586 | 186514.650 |         88 |    Flash |   18.06x
+```
+
+居然没有OOM？不会吧。我们在bench.py里为什么OOM了？
 
 ## 删除official bench的随机性，添加命令行参数`--attn-backend`
 我修改了[official bench代码](bench.py)的随机性，原来他的代码是定下一个max-input-len和max-output-len，然后`randint(100, max)`随机取输入输出长度，我觉得还是定下来我比较安心，就把randint删掉了。

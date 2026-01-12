@@ -41,8 +41,10 @@ class Qwen3Attention(nn.Module):
         # 新增backend可选，通过config传递。方便bench时候，一个脚本执行两种backend对比。
         self.attn_backend = attn_backend
         if attn_backend == "flash":
+            # print("[LOG] Using flash attention backend")
             from nanovllm.layers.attention import Attention
         elif attn_backend == "sdpa":
+            # print("[LOG] Using sdpa attention backend")
             from nanovllm.layers.attention_sdpa import Attention
         else:
             raise ValueError(f"Unknown attention backend: {attn_backend}")

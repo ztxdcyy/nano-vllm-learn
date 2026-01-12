@@ -20,7 +20,8 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
+        # SDPA 后端在捕获 CUDA graph 时存在限制，强制退回 eager
+        self.enforce_eager = config.enforce_eager or getattr(config.hf_config, "attn_backend", "flash") == "sdpa"
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event

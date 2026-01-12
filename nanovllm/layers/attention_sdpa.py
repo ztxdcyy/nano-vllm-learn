@@ -146,6 +146,9 @@ def flash_attn_with_kvcache(
         flat_idx = block_ids * block_size + offset       # [B, S]
         cache_flat_k = k_cache.view(-1, k_cache.size(2), k_cache.size(3))
         cache_flat_v = v_cache.view(-1, v_cache.size(2), v_cache.size(3))
+        # 2026年1月12日23:41:33 这里组大buffer很容易OOM
+        # 先测试小bsz下能不能跑通，然后在bench_my里做表格对比，找到什么时候OOM
+        # 再考虑优化显存，不组大buffer，或者设定utilization，限制实例初始化kvcache-block占用的显存大小。
         batch_k = cache_flat_k[flat_idx]                 # [B, S, num_kv_heads, head_dim]
         batch_v = cache_flat_v[flat_idx]
         kv_valid = positions.unsqueeze(0) < cache_seqlens.unsqueeze(1)   # [B, S] bool
