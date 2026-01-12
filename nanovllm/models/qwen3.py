@@ -4,7 +4,6 @@ import torch.distributed as dist
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
-from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
@@ -24,6 +23,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        attn_backend: str = "flash",
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -37,6 +37,16 @@ class Qwen3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+
+        # 新增backend可选，通过config传递。方便bench时候，一个脚本执行两种backend对比。
+        self.attn_backend = attn_backend
+        if attn_backend == "flash":
+            from nanovllm.layers.attention import Attention
+        elif attn_backend == "sdpa":
+            from nanovllm.layers.attention_sdpa import Attention
+        else:
+            raise ValueError(f"Unknown attention backend: {attn_backend}")
+            
 
         # 继承的ColumnParallel，沿着dim=0做切分
         # Pytorch中，输入tensor x 按照行向量存储，一个样本是一行，这样符合c语言库存储习惯。
@@ -146,6 +156,7 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            attn_backend=getattr(config, "attn_backend", "flash"),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,

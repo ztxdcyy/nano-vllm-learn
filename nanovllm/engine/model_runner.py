@@ -154,14 +154,12 @@ class ModelRunner:
 
     # prepare 主要是创建 tensor， padding，并且传输到 gpu 上
     def prepare_block_tables(self, seqs: list[Sequence]):
-        # Python 语法糖：列表推导式
         max_len = max(len(seq.block_table) for seq in seqs)
         # 使用 -1 做 padding
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         # 创建张量，使用pin memory，可以使用 DMA engine 优化CPU→GPU传输
         # Copies between page-locked host memory and device memory can be performed concurrently with kernel execution for some devices 
         # bandwidth between host memory and device memory is higher if host memory is allocated as page-locked and even higher if in addition it is allocated as write-combining as described in Write-Combining Memory. ———— cuda 编程手册
-        # img/pined mem from cuda.png
         # .cuda(non_blocking=True) - 异步传输到GPU，不阻塞CPU
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables

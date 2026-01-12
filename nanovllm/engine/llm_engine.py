@@ -15,9 +15,11 @@ from nanovllm.engine.model_runner import ModelRunner
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        self._exited = False
+        # 只保留在 Config dataclass 里声明的字段
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        # 获取启动配置参数
+        # 实例化config
         config = Config(model, **config_kwargs)
         self.ps = []        # 存储TP子进程列表
         self.events = []       # 进程间同步事件列表 
@@ -43,9 +45,18 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
-        for p in self.ps:
+        # 防止重复销毁（bench 手动调用 + atexit）
+        if getattr(self, "_exited", False):
+            return
+        self._exited = True
+        # model_runner 可能已被手动删除
+        if hasattr(self, "model_runner"):
+            try:
+                self.model_runner.call("exit")
+            except Exception:
+                pass
+            del self.model_runner
+        for p in getattr(self, "ps", []):
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
