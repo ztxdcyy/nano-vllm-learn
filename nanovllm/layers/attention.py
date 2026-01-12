@@ -53,8 +53,8 @@ def store_kvcache(key: torch.Tensor,
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
     # 启动triton kernel：one dimension grid
-    str = "="*30 + "slot mapping and stride" +"="*30 + '\n'
-    _print_once(str, "slot_mapping: ", slot_mapping, "\n key.shape:", key.shape, "\n k_cache.shape:", k_cache.shape,"\n D:", D)
+    # str = "="*30 + "slot mapping and stride" +"="*30 + '\n'
+    # _print_once(str, "slot_mapping: ", slot_mapping, "\n key.shape:", key.shape, "\n k_cache.shape:", k_cache.shape,"\n D:", D)
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
