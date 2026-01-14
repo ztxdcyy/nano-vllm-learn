@@ -8,15 +8,20 @@ from nanovllm import LLM, SamplingParams
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--attn-backend", type=str, default="flash", choices=["flash", "sdpa"],
-                        help="Attention backend to use (flash or sdpa)")
+    parser.add_argument(
+        "--attn-backend",
+        type=str,
+        default="flash",
+        choices=["flash", "sdpa", "sdpa.math", "triton"],
+        help="Attention backend to use (flash, sdpa.math, or triton)",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     seed(0)
-    num_seqs = 256
+    num_seqs = 64
     max_input_len = 1024
     max_ouput_len = 1024
 

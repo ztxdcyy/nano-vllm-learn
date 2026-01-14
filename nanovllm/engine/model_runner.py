@@ -20,8 +20,11 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        # SDPA 后端在捕获 CUDA graph 时存在限制，强制退回 eager
-        self.enforce_eager = config.enforce_eager or getattr(config.hf_config, "attn_backend", "flash") == "sdpa"
+
+        attn_backend = getattr(config.hf_config, "attn_backend", "flash")
+        # 现在的做法：sdpa后端统一走eager。因为flash-attn用的是自己的paged-attn-kernel，有自己的处理kvcache的逻辑，不用组大buffer，不会爆显存。
+        self.enforce_eager = config.enforce_eager or attn_backend.startswith("sdpa")
+        
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -274,6 +277,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        # 只有decode会用cudagraph；而且不能是enforce_eager；而且输入长度不能大于512，否则自动切换成eager模式
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:

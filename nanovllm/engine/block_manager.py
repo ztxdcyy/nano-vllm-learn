@@ -135,10 +135,19 @@ class BlockManager:
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
+            # 本来这里是一个断言，假如前一个块没有hash，直接报错退出。
+            # 如果前一个块尚未写入 hash，这里做一次补偿
+            if last_block.hash == -1:
+                token_ids = seq.block(seq.num_blocks - 1)
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix) if len(token_ids) == self.block_size else -1
+                if h != -1:
+                    last_block.update(h, token_ids)
+                    self.hash_to_block_id[h] = last_block.block_id
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
+        # 非满块到满块的补偿机制，假如正好整除了，计算最后一个块的hash
         elif len(seq) % self.block_size == 0:
             assert last_block.hash == -1
             token_ids = seq.block(seq.num_blocks-1)

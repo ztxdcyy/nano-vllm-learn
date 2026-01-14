@@ -16,6 +16,14 @@ def _print_once(*args):
         print(*args)
         _print_once_done = True
 
+
+def _resolve_sdpa_backend(attn_backend: str):
+    """Map string flag to torch SDPA backend enum."""
+    if attn_backend in ("sdpa", "sdpa.math"):
+        return SDPBackend.MATH
+    raise ValueError(f"Unsupported SDPA backend: {attn_backend}")
+
+
 # ==================== 保留原有的 store_kvcache kernel ====================
 @triton.jit
 def store_kvcache_kernel(
@@ -63,6 +71,7 @@ def flash_attn_varlen_func(
     max_seqlen_k: int,
     cu_seqlens_k: torch.Tensor,
     causal,
+    sdpa_backend,
     block_table: Optional[torch.Tensor] = None,         # TODO 实现 prefix caching 的时候，prefill 也需要 kvcache
 ) -> torch.Tensor:
     batch_size = cu_seqlens_q.shape[0] - 1
@@ -91,7 +100,8 @@ def flash_attn_varlen_func(
         q_i, k_i, v_i = [tensor.unsqueeze(0).transpose(1, 2) for tensor in [q_i, k_i, v_i]]
         
         # 注意不用自己重复 attn head，交给 SDPA 去处理 GQA
-        with sdpa_kernel(backends=[SDPBackend.MATH]):
+        # 所以prefill使用SDPA是可行的？
+        with sdpa_kernel(backends=[sdpa_backend]):
             output_i = F.scaled_dot_product_attention(
                 q_i, k_i, v_i,
                 attn_mask=None,
@@ -116,6 +126,7 @@ def flash_attn_with_kvcache(
     cache_seqlens: torch.Tensor,
     block_table: Optional[torch.Tensor] = None,
     causal: bool = False,
+    sdpa_backend = SDPBackend.MATH,
 ) -> torch.Tensor:
 
     batch_size = q.shape[0]
@@ -149,7 +160,7 @@ def flash_attn_with_kvcache(
         # 2026年1月12日23:41:33 这里组大buffer很容易OOM
         # 先测试小bsz下能不能跑通，然后在bench_my里做表格对比，找到什么时候OOM
         # 再考虑优化显存，不组大buffer，或者设定utilization，限制实例初始化kvcache-block占用的显存大小。
-        batch_k = cache_flat_k[flat_idx]                 # [B, S, num_kv_heads, head_dim]
+        batch_k = cache_flat_k[flat_idx]                 # [B, max_blocks * block_size, num_kv_heads, head_dim]
         batch_v = cache_flat_v[flat_idx]
         kv_valid = positions.unsqueeze(0) < cache_seqlens.unsqueeze(1)   # [B, S] bool
         batch_k = batch_k * kv_valid.unsqueeze(-1).unsqueeze(-1)
@@ -158,7 +169,7 @@ def flash_attn_with_kvcache(
 
     q_sdpa, k_sdpa, v_sdpa = [tensor.transpose(1, 2) for tensor in [q, batch_k, batch_v]]
 
-    with sdpa_kernel(backends=[SDPBackend.MATH]):
+    with sdpa_kernel(backends=[sdpa_backend]):
         output = F.scaled_dot_product_attention(
             q_sdpa, k_sdpa, v_sdpa,
             attn_mask=attn_mask,
@@ -201,12 +212,15 @@ class Attention(nn.Module):
         head_dim: int,
         scale: float,
         num_kv_heads: int,
+        attn_backend: str = "sdpa.math",
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
+        self.attn_backend = attn_backend
+        self.sdpa_backend = _resolve_sdpa_backend(attn_backend)
         
         # Initialize KV cache
         self.k_cache = self.v_cache = torch.tensor([])
@@ -237,6 +251,7 @@ class Attention(nn.Module):
                 max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                 max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                 causal=True,
+                sdpa_backend=self.sdpa_backend,
                 block_table=context.block_tables
             ) 
 
@@ -248,6 +263,7 @@ class Attention(nn.Module):
                 cache_seqlens=context.context_lens,
                 block_table=context.block_tables,
                 causal=False,
+                sdpa_backend=self.sdpa_backend,
             )
         
         return o.view(-1, self.num_heads * self.head_dim)

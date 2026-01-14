@@ -24,6 +24,7 @@ class Qwen3Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
         attn_backend: str = "flash",
+        block_size: int = 256,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -43,9 +44,14 @@ class Qwen3Attention(nn.Module):
         if attn_backend == "flash":
             # print("[LOG] Using flash attention backend")
             from nanovllm.layers.attention import Attention
-        elif attn_backend == "sdpa":
+            attn_kwargs = {}
+        elif attn_backend.startswith("sdpa"):
             # print("[LOG] Using sdpa attention backend")
             from nanovllm.layers.attention_sdpa import Attention
+            attn_kwargs = {"attn_backend": attn_backend}
+        elif attn_backend == "triton":
+            from nanovllm.layers.attention_triton import Attention
+            attn_kwargs = {"block_size": block_size}
         else:
             raise ValueError(f"Unknown attention backend: {attn_backend}")
             
@@ -85,6 +91,7 @@ class Qwen3Attention(nn.Module):
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
+            **attn_kwargs,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -159,6 +166,7 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
             attn_backend=getattr(config, "attn_backend", "flash"),
+            block_size=getattr(config, "kvcache_block_size", 256),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
